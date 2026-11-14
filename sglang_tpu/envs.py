@@ -528,7 +528,7 @@ class TpuEnvs:
     # (disaggregation/decode_dram_offload/startup_validation.py).
     SGLANG_ENABLE_PREFILL_KV_OFFLOAD_TO_DECODE_DRAM = EnvBool(False)
     # Muse expert layout for the megakernel: tp | ep | auto
-    # (auto: ep when the server's EP size > 1). muse_megakernel/moe_mode.py.
+    # (auto: ep when the server's EP size > 1). muse_megakernel/common/moe_mode.py.
     SGLANG_TPU_MUSE_MOE_MODE = EnvStr("auto")
     # Largest megakernel step in rows (running requests x verify tokens, padded to the
     # TP size); larger steps run the native decoder. Steps above 32 rows run the
@@ -555,8 +555,9 @@ class TpuEnvs:
     # 128k / 256k / 512k and nothing at q = 8.
     SGLANG_TPU_MK_SAL_FP8_DOT = EnvInt(0)
     # Profiling only: name the megakernel's in-kernel regions for xprof (needs libtpu
-    # --xla_enable_custom_call_region_trace=true and a device tracer level above 1);
-    # 2 also names the per-chunk / per-expert regions, which distort the timing they show.
+    # --xla_enable_custom_call_region_trace=true and a device tracer level above 1): 1 per
+    # phase (decode TP regions, decode EP phases); 2 also per chunk / expert / EP arm, which
+    # distorts the timing they show.
     SGLANG_TPU_MK_TRACE_REGIONS = EnvInt(0)
     # Megakernel attention: fold a power-of-two attn_scale into the bf16 queries instead of
     # scaling every score (exact).
@@ -565,11 +566,11 @@ class TpuEnvs:
     # matvecs (not bit-exact: the matvec input rounding moves; verify steps only).
     SGLANG_TPU_MUSE_MK_FOLD = EnvBool(True)
     # Muse megakernel Wave 1-4 optimizations (hoisted SAL refill, stack2 QK/PV, all-VMEM
-    # collective/expert scratch on row-tiled steps, 2D PairColl collectives, vectorized routing).
+    # collective/expert scratch on row-tiled steps, pair-route collectives, vectorized routing).
     SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
-    # Decode megakernel (TP): fp4 experts requantized at load to one bf16 scale per this many K
-    # rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the expert dots push raw
-    # e2m1 codes to the MXU (MKConfig.qblock).
+    # Muse megakernels (decode TP / EP, prefill): fp4 experts requantized at load to one bf16
+    # scale per this many K rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the
+    # expert dots push raw e2m1 codes to the MXU (MKConfig.qblock, decode.ep.experts.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
     # Muse megakernel: extend and mixed steps run the prefill program (muse_megakernel/prefill/)
     # on the kernel's weights. Needs TP 8, fp8 SEQ_ALONG_LANE pools, pallas_tpu_rpa_batched
@@ -578,6 +579,9 @@ class TpuEnvs:
     # Prefill program: the expert-input and post-expert-projection all-gathers in e4m3, one
     # scale per block: half their ICI bytes, ~2^-4 relative error per element.
     SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)
+    # Prefill program in the sequence-parallel layout (prefill/sp): each rank owns rows / tp of
+    # the chunk between layers, instead of every rank holding every row (prefill/tp).
+    SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
@@ -590,21 +594,16 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_YSEND_PLAN = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_SLOTS = EnvInt(None)
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
-    # EP megakernel arm: auto | a2a | gather; auto takes a2a from EP_MIN_ROWS rows up.
-    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("auto")
-    SGLANG_TPU_MUSE_MK_EP_MIN_ROWS = EnvInt(None)
-    # EP fp4 experts requantized to one scale per this many K rows (0 off).
-    SGLANG_TPU_EP_QBLOCK = EnvInt(0)
-    # Largest EP block-diagonal arm in rows (ep_mk/experts.BD_ARMS).
+    # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
+    SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
+    # Largest EP block-diagonal arm in rows (decode/ep/experts.BD_ARMS).
     SGLANG_TPU_EP_BD_MAX = EnvInt(None)
     # Rows from which EP all-gathers relay through the partner core (gather.PAIR_AG_MIN_ROWS).
     SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS = EnvInt(None)
     # EP megakernel without Pallas bounds checks.
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
-    # Timing only (wrong results): comma-separated EP phases every rank skips (ep_mk/layer.py).
+    # Timing only (wrong results): comma-separated EP phases every rank skips (decode/ep/layer.py).
     SGLANG_TPU_EP_DEV_SKIP = EnvStr("")
-    # EP in-kernel xprof regions: 1 per phase, 2 per expert chunk / arm too.
-    SGLANG_TPU_EP_TRACE = EnvInt(0)
 
     @classmethod
     def names(cls) -> list[str]:

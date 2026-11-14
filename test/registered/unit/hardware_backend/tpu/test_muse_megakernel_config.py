@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang_tpu.muse_megakernel import kernel as K
 from sglang_tpu.muse_megakernel import ops
-from sglang_tpu.muse_megakernel.ep_mk.config import ep_mk_config
+from sglang_tpu.muse_megakernel.decode.ep.config import ep_mk_config
+from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 
 register_tpu_ci(est_time=2, suite="stage-a-test-tpu-unit", chips=1)
 

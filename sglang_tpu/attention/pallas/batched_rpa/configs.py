@@ -161,6 +161,16 @@ class ServingConfigs:
     def packing_kv(self) -> int:
         return utils.get_dtype_packing(self.dtype_kv)
 
+    @property
+    def packing_out(self) -> int:
+        return utils.get_dtype_packing(self.dtype_out)
+
+    @property
+    def separate_out(self) -> bool:
+        """The output does not fit the q buffer's packing (e.g. e4m3 q, bf16 output): it
+        gets its own HBM buffer instead of overwriting q in place."""
+        return self.packing_out != self.packing_q
+
 
 class RpaCase(enum.StrEnum):
     """Represents the different cases for Ragged Paged Attention.
@@ -388,6 +398,24 @@ class RpaConfigs:
             self.block.bq_sz,
             q_per_kv_packing,
             self.serve.packing_q,
+            self.aligned_q_head_dim,
+        )
+
+    @property
+    def o_vmem_shape(self):
+        """q_vmem_shape regrouped by the output dtype's packing."""
+        packing_out = self.serve.packing_out
+        if self.aligned_num_q_heads_per_kv_head % packing_out:
+            raise ValueError(
+                f"{self.aligned_num_q_heads_per_kv_head} q heads per KV head do not group "
+                f"into the output packing {packing_out}"
+            )
+        return (
+            self.block.batch_size,
+            self.model.num_kv_heads,
+            self.block.bq_sz,
+            self.aligned_num_q_heads_per_kv_head // packing_out,
+            packing_out,
             self.aligned_q_head_dim,
         )
 

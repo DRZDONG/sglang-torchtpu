@@ -1,0 +1,153 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="634" height="2034" viewBox="0 0 634 2034">
+<rect width="634" height="2034" fill="#ffffff"/>
+<text x="20" y="28" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="17" font-weight="700" fill="#1f2328">Muse Spark per-layer communication (TP 8)</text>
+<text x="20" y="46" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="12" fill="#57606a">H=8192 He=4096 E=256 top_k=8 Q128/KV16 hd64</text>
+<text x="20" y="70" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#1f2328">dtype colors:</text>
+<rect x="112" y="57" width="31.6" height="18" rx="9" fill="#d1242f" fill-opacity="0.12" stroke="#d1242f"/>
+<text x="127.8" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#d1242f">f32</text>
+<rect x="153.6" y="57" width="38.8" height="18" rx="9" fill="#1f6feb" fill-opacity="0.12" stroke="#1f6feb"/>
+<text x="173.0" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#1f6feb">bf16</text>
+<rect x="202.39999999999998" y="57" width="67.6" height="18" rx="9" fill="#bc4c00" fill-opacity="0.12" stroke="#bc4c00"/>
+<text x="236.2" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#bc4c00">fp8 e4m3</text>
+<rect x="280.0" y="57" width="82.0" height="18" rx="9" fill="#8250df" fill-opacity="0.12" stroke="#8250df"/>
+<text x="321.0" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#8250df">NVFP4 e2m1</text>
+<rect x="372.0" y="57" width="46.0" height="18" rx="9" fill="#57606a" fill-opacity="0.12" stroke="#57606a"/>
+<text x="395.0" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#57606a">int32</text>
+<rect x="428.0" y="57" width="31.6" height="18" rx="9" fill="#0a7d62" fill-opacity="0.12" stroke="#0a7d62"/>
+<text x="443.8" y="70" text-anchor="middle" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11.5" font-weight="700" fill="#0a7d62">u32</text>
+<text x="20" y="92" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12" fill="#57606a">Solid box = compute; dashed box = communication (⇄). Top right: wire bytes per rank per row · per layer per block</text>
+<text x="54" y="116" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="16" font-weight="700" fill="#1f2328">(3) Prefill SP + EP8, target (count-sized receive)</text>
+<text x="54" y="136" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">Wave 1 dtypes as (2), plus the receive side sized from the counts (in-kernel</text>
+<text x="54" y="152" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">remote-DMA ragged a2a, a later wave). Not implemented yet</text>
+<text x="54" y="172" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#cf222e">31.5 KiB/row · 126 MiB/layer @R=4096 · 7 collectives/layer</text>
+<text x="54" y="190" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#8250df">HBM DMA = 94 MiB + E(R) + 235.8 KiB x R = ~1,817 MiB/layer @R=4096 (E=780) + KV</text>
+<text x="54" y="206" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" fill="#57606a" xml:space="preserve">assumes receive buffers sized to rows actually received (~R), not R*8</text>
+<rect x="12" y="226" width="610" height="528" rx="6" fill="#f3f7fd"/>
+<text x="30" y="490.0" transform="rotate(-90 30 490.0)" text-anchor="middle" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="14" font-weight="700" fill="#2f6fdb">Attention</text>
+<rect x="54" y="240" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="240" width="5" height="64" rx="2" fill="#2f6fdb"/>
+<text x="66" y="261" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">input_layernorm (own rows)</text>
+<text x="68" y="277" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">stream [R/8, H] <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; RMS <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; a_in [R/8, H] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan></text>
+<text x="68" y="292" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="10.5" fill="#57606a" xml:space="preserve">per-row / per-block <tspan fill="#d1242f" font-weight="700">f32</tspan> scale (coll.py to_fp8)</text>
+<line x1="304.0" y1="304" x2="304.0" y2="314" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,312 L304.0,318 L308.0,312 Z" fill="#8c959f"/>
+<rect x="54" y="318" width="500" height="64" rx="5" fill="#e3edfb" stroke="#2f6fdb" stroke-width="1.4" stroke-dasharray="5 3"/>
+<rect x="64" y="341" width="120" height="3" fill="#2f6fdb"/>
+<text x="544" y="339" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#24292f">7 KiB/row · 28 MiB</text>
+<text x="66" y="339" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">⇄ a_in AG (fp8 + scale)</text>
+<text x="68" y="355" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">[R/8, H] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> -&gt; [R, H] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan>, scale <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<text x="68" y="370" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">= 7/8 x H x 1B = 7/8 x 8192 x 1 = 7 KiB (+ 4 B row scale)</text>
+<line x1="304.0" y1="382" x2="304.0" y2="392" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,390 L304.0,396 L308.0,390 Z" fill="#8c959f"/>
+<rect x="54" y="396" width="500" height="79" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="396" width="5" height="79" rx="2" fill="#2f6fdb"/>
+<text x="66" y="417" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">qkvg (fp8 x fp8) + attention</text>
+<text x="68" y="433" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">a_in <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> @ wqkvg <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> -&gt; <tspan fill="#d1242f" font-weight="700">f32</tspan> acc</text>
+<text x="68" y="448" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">head-RMS <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; q <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> (RPA q_scale); K/V <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan></text>
+<text x="68" y="463" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">P <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan>; QK / PV acc <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<line x1="304.0" y1="475" x2="304.0" y2="485" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,483 L304.0,489 L308.0,483 Z" fill="#8c959f"/>
+<rect x="54" y="489" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="489" width="5" height="64" rx="2" fill="#2f6fdb"/>
+<text x="66" y="510" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">o_proj (fp8 x fp8)</text>
+<text x="68" y="526" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">head-RMS(o) <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; gated <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> @ wo <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan></text>
+<text x="68" y="541" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">-&gt; <tspan fill="#d1242f" font-weight="700">f32</tspan> acc -&gt; partial [R, H] <tspan fill="#1f6feb" font-weight="700">bf16</tspan></text>
+<line x1="304.0" y1="553" x2="304.0" y2="563" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,561 L304.0,567 L308.0,561 Z" fill="#8c959f"/>
+<rect x="54" y="567" width="500" height="64" rx="5" fill="#e3edfb" stroke="#2f6fdb" stroke-width="1.4" stroke-dasharray="5 3"/>
+<rect x="64" y="590" width="120" height="3" fill="#2f6fdb"/>
+<text x="544" y="588" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#24292f">14 KiB/row · 56 MiB</text>
+<text x="66" y="588" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">⇄ o RS (bf16: sum feeds post-attn norm)</text>
+<text x="68" y="604" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">partial [R, H] <tspan fill="#1f6feb" font-weight="700">bf16</tspan> -&gt; [R/8, H] <tspan fill="#1f6feb" font-weight="700">bf16</tspan></text>
+<text x="68" y="619" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">= 7/8 x H x 2B = 7/8 x 8192 x 2 = 14 KiB</text>
+<line x1="304.0" y1="631" x2="304.0" y2="641" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,639 L304.0,645 L308.0,639 Z" fill="#8c959f"/>
+<rect x="54" y="645" width="500" height="49" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="645" width="5" height="49" rx="2" fill="#2f6fdb"/>
+<text x="66" y="666" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">attention residual (own rows)</text>
+<text x="68" y="682" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">post-attn RMS <tspan fill="#d1242f" font-weight="700">f32</tspan>; stream [R/8, H] <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<text x="554" y="746" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#8250df">KV read: 244 MiB per 1M attended tokens (fp8 pool, required)</text>
+<text x="554" y="732" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#8250df">HBM DMA: weights 26 MiB + act 70.25 KiB x R</text>
+<text x="554" y="718" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#57606a">comm: 21 KiB/row · 84 MiB</text>
+<rect x="12" y="778" width="610" height="279" rx="6" fill="#fdf6f1"/>
+<text x="30" y="917.5" transform="rotate(-90 30 917.5)" text-anchor="middle" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="14" font-weight="700" fill="#e8590c">Pooler</text>
+<rect x="54" y="792" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="792" width="5" height="64" rx="2" fill="#e8590c"/>
+<text x="66" y="813" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">pre-FFN norm + router (open)</text>
+<text x="68" y="829" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">RMS <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; ffn [R/8, H] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan></text>
+<text x="68" y="844" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">router input / logits: <tspan fill="#1f6feb" font-weight="700">bf16</tspan> / <tspan fill="#d1242f" font-weight="700">f32</tspan> until GSM8K A/B</text>
+<line x1="304.0" y1="856" x2="304.0" y2="866" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,864 L304.0,870 L308.0,864 Z" fill="#8c959f"/>
+<rect x="54" y="870" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="870" width="5" height="64" rx="2" fill="#e8590c"/>
+<text x="66" y="891" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">pooler (replicated, fp8 x fp8)</text>
+<text x="68" y="907" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">ffn <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> @ wpool [H, He] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> -&gt; <tspan fill="#d1242f" font-weight="700">f32</tspan> acc</text>
+<text x="68" y="922" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="10.5" fill="#57606a" xml:space="preserve">no collective: wpool is replicated</text>
+<line x1="304.0" y1="934" x2="304.0" y2="944" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,942 L304.0,948 L308.0,942 Z" fill="#8c959f"/>
+<rect x="54" y="948" width="500" height="49" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="948" width="5" height="49" rx="2" fill="#e8590c"/>
+<text x="66" y="969" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">pre-expert norm (own rows)</text>
+<text x="68" y="985" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">RMS <tspan fill="#d1242f" font-weight="700">f32</tspan> -&gt; xe [R/8, He] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> + <tspan fill="#d1242f" font-weight="700">f32</tspan> scale</text>
+<text x="554" y="1049" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#8250df">HBM DMA: weights 36 MiB + act 3 KiB x R</text>
+<text x="554" y="1035" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#57606a">comm: 0 KiB/row · 0 MiB</text>
+<rect x="12" y="1081" width="610" height="510" rx="6" fill="#f2faf6"/>
+<text x="30" y="1336.0" transform="rotate(-90 30 1336.0)" text-anchor="middle" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="14" font-weight="700" fill="#2b9a66">MoE</text>
+<rect x="54" y="1095" width="500" height="64" rx="5" fill="#ddf2e7" stroke="#2b9a66" stroke-width="1.4" stroke-dasharray="5 3"/>
+<rect x="64" y="1118" width="120" height="3" fill="#2b9a66"/>
+<text x="544" y="1116" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#24292f">0 B/row · 0 MiB</text>
+<text x="66" y="1116" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">⇄ count exchange (AG x2)</text>
+<text x="68" y="1132" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">send_sizes / in_off [8] <tspan fill="#57606a" font-weight="700">int32</tspan> -&gt; [8, 8] <tspan fill="#57606a" font-weight="700">int32</tspan></text>
+<text x="68" y="1147" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">= 2 AG x 7 peers x 8 x 4B = 448 B per layer, not per row</text>
+<line x1="304.0" y1="1159" x2="304.0" y2="1169" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,1167 L304.0,1173 L308.0,1167 Z" fill="#8c959f"/>
+<rect x="54" y="1173" width="500" height="94" rx="5" fill="#ddf2e7" stroke="#2b9a66" stroke-width="1.4" stroke-dasharray="5 3"/>
+<rect x="64" y="1196" width="120" height="3" fill="#2b9a66"/>
+<text x="544" y="1194" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#24292f">3.50 KiB/row · 14 MiB</text>
+<text x="66" y="1194" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">⇄ dispatch ragged a2a (fp8 + scale)</text>
+<text x="68" y="1210" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">xe[pairs] [R/8*8, He] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> -&gt; recv [R*8, He]</text>
+<text x="68" y="1225" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">local expert ids <tspan fill="#57606a" font-weight="700">int32</tspan> + row scales <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<text x="68" y="1240" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">= 1/8 own rows x 8 slots x He x 1B x 7/8</text>
+<text x="68" y="1255" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">  = 1/8 x 8 x 4096 x 1 x 7/8 = 3.5 KiB</text>
+<line x1="304.0" y1="1267" x2="304.0" y2="1277" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,1275 L304.0,1281 L308.0,1275 Z" fill="#8c959f"/>
+<rect x="54" y="1281" width="500" height="79" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="1281" width="5" height="79" rx="2" fill="#2b9a66"/>
+<text x="66" y="1302" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">experts (EP, gmm_v2)</text>
+<text x="68" y="1318" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">xe <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> x <tspan fill="#8250df" font-weight="700">NVFP4 e2m1</tspan> / <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> weights</text>
+<text x="68" y="1333" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">h = silu(g)*u -&gt; <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> into w2; acc <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<text x="68" y="1348" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">y -&gt; <tspan fill="#1f6feb" font-weight="700">bf16</tspan> (feeds post-expert norm)</text>
+<line x1="304.0" y1="1360" x2="304.0" y2="1370" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,1368 L304.0,1374 L308.0,1368 Z" fill="#8c959f"/>
+<rect x="54" y="1374" width="500" height="79" rx="5" fill="#ddf2e7" stroke="#2b9a66" stroke-width="1.4" stroke-dasharray="5 3"/>
+<rect x="64" y="1397" width="120" height="3" fill="#2b9a66"/>
+<text x="544" y="1395" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="12.5" font-weight="700" fill="#24292f">7 KiB/row · 28 MiB</text>
+<text x="66" y="1395" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">⇄ combine ragged a2a (bf16)</text>
+<text x="68" y="1411" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">y [R*8, He] <tspan fill="#1f6feb" font-weight="700">bf16</tspan> -&gt; owner [R/8*8, He] <tspan fill="#1f6feb" font-weight="700">bf16</tspan></text>
+<text x="68" y="1426" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">= 1/8 own rows x 8 slots x He x 2B x 7/8</text>
+<text x="68" y="1441" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" font-weight="700" fill="#0a3069" xml:space="preserve">  = 1/8 x 8 x 4096 x 2 x 7/8 = 7 KiB</text>
+<line x1="304.0" y1="1453" x2="304.0" y2="1463" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,1461 L304.0,1467 L308.0,1461 Z" fill="#8c959f"/>
+<rect x="54" y="1467" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="1467" width="5" height="64" rx="2" fill="#2b9a66"/>
+<text x="66" y="1488" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">combine (owner rows)</text>
+<text x="68" y="1504" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">post-expert RMS <tspan fill="#d1242f" font-weight="700">f32</tspan>; x tw <tspan fill="#d1242f" font-weight="700">f32</tspan>, sum k</text>
+<text x="68" y="1519" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">-&gt; u [R/8, He] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan></text>
+<text x="554" y="1583" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#8250df">HBM DMA: weights E(R) = 780 MiB + act 150 KiB x R</text>
+<text x="554" y="1569" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#57606a">comm: 10.5 KiB/row · 42 MiB</text>
+<rect x="12" y="1615" width="610" height="201" rx="6" fill="#fdfaf0"/>
+<text x="30" y="1715.5" transform="rotate(-90 30 1715.5)" text-anchor="middle" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="14" font-weight="700" fill="#e0a100">Unpooler</text>
+<rect x="54" y="1629" width="500" height="64" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="1629" width="5" height="64" rx="2" fill="#e0a100"/>
+<text x="66" y="1650" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">unpooler (replicated, fp8 x fp8)</text>
+<text x="68" y="1666" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">u <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> @ wunpool [He, H] <tspan fill="#bc4c00" font-weight="700">fp8 e4m3</tspan> -&gt; <tspan fill="#d1242f" font-weight="700">f32</tspan> acc</text>
+<text x="68" y="1681" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">-&gt; f [R/8, H] <tspan fill="#1f6feb" font-weight="700">bf16</tspan> (feeds post-FFN norm)</text>
+<line x1="304.0" y1="1693" x2="304.0" y2="1703" stroke="#8c959f" stroke-width="1.2"/><path d="M300.0,1701 L304.0,1707 L308.0,1701 Z" fill="#8c959f"/>
+<rect x="54" y="1707" width="500" height="49" rx="4" fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+<rect x="54" y="1707" width="5" height="49" rx="2" fill="#e0a100"/>
+<text x="66" y="1728" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="13" font-weight="700" fill="#1f2328">post-FFN norm + residual (own rows)</text>
+<text x="68" y="1744" font-family="'JetBrains Mono','DejaVu Sans Mono','Menlo',monospace" font-size="11" fill="#24292f" xml:space="preserve">RMS <tspan fill="#d1242f" font-weight="700">f32</tspan>; stream [R/8, H] <tspan fill="#d1242f" font-weight="700">f32</tspan></text>
+<text x="554" y="1808" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#8250df">HBM DMA: weights 32 MiB + act 12.5 KiB x R</text>
+<text x="554" y="1794" text-anchor="end" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11" font-weight="600" fill="#57606a">comm: 0 KiB/row · 0 MiB</text>
+<text x="20" y="1860" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">R = rows this step: prefill = chunk tokens (block size 4096); decode = B rounded up to 8</text>
+<text x="20" y="1878" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">R/8 = rows owned by one rank; n = 8; H = 8192; He = 4096; I = 4096 (512 per rank)</text>
+<text x="20" y="1896" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">pooler / unpooler = pre_expert_proj (H-&gt;He) / post_expert_proj (He-&gt;H)</text>
+<text x="20" y="1914" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">KiB/row = bytes one rank sends to the other 7 per token row (AG: own block x7; RS: 7/8 of partial)</text>
+<text x="20" y="1932" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">MiB = KiB/row x R / 1024, one layer, one rank</text>
+<text x="20" y="1950" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">HBM DMA = fixed weights + E(R) experts + per-row KiB x R, per layer per rank (estimate: each HBM</text>
+<text x="20" y="1968" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">  tensor written once, read once); E(R) = 780 MiB x (1 - (31/32)^R), x EP worst-rank imbalance;</text>
+<text x="20" y="1986" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">  tile re-reads and XLA fusion not modeled; fp4 experts at QBLOCK=256 (3.05 MiB per expert-TP slice)</text>
+<text x="20" y="2004" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">Decode columns (4)-(8) all use R=64 (spec decoding), so their numbers compare directly</text>
+<text x="20" y="2022" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">decode packs <tspan fill="#1f6feb" font-weight="700">bf16</tspan> pairs into <tspan fill="#0a7d62" font-weight="700">u32</tspan> words (common/packing.py)</text>
+<text x="20" y="2040" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">FP8_GATHER only affects the xe / u AG of (1); (2) rejects it</text>
+<text x="20" y="2058" font-family="'Inter','Helvetica Neue','Arial',sans-serif" font-size="11.5" fill="#57606a" xml:space="preserve">(2) is uncommitted wave 1: it requires MOE_MODE=ep, which serving still rejects</text>
+</svg>

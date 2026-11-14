@@ -514,6 +514,7 @@ def rpa_body(
 
 def create_allocs(
     kv_cache_hbm_ref: jax.Ref,
+    q_hbm_ref: jax.Ref,
     o_hbm_ref: jax.Ref,
     lse_hbm_ref: jax.Ref | None,
     cfgs: configs.RpaConfigs,
@@ -537,7 +538,7 @@ def create_allocs(
         pipeline_mode=pl.Buffered(buffer_count=cfgs.n_buffer, use_lookahead=True),
     )
     o_spec = pl.BlockSpec(
-        block_shape=cfgs.q_vmem_shape,
+        block_shape=cfgs.o_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i,),
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
@@ -557,7 +558,7 @@ def create_allocs(
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
-        dtype_or_type=o_hbm_ref,
+        dtype_or_type=q_hbm_ref,
         buffer_count=cfgs.n_buffer,
         use_lookahead=True,
         cfgs=cfgs,
@@ -636,6 +637,7 @@ def rpa_kernel(
     lse_hbm: jax.Array | None = None,
     cp_rank: jax.Array | None = None,
     kv_lens_global: jax.Array | None = None,
+    o_hbm: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -664,6 +666,9 @@ def rpa_kernel(
             return_lse, else None. Lane g holds aligned q head g.
         cp_rank: [1] with cp_group_size, else None.
         kv_lens_global: [max_num_seqs] with cp_group_size, else None.
+        o_hbm: with cfgs.serve.separate_out, the output buffer (q_hbm's layout in the
+            output dtype's packing), updated in place; else None: the output overwrites
+            q_hbm.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -688,16 +693,18 @@ def rpa_kernel(
         kv_cache_hbm_ref: jax.Ref,
         sink_ref: jax.Ref | None,
         lse_hbm_ref: jax.Ref | None,
+        o_in_hbm_ref: jax.Ref | None,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
         o_lse_hbm_ref: jax.Ref | None,
     ):
 
-        del o_kv_cache_hbm_ref, o_lse_hbm_ref
+        # o_in_hbm_ref aliases o_hbm_ref (separate_out)
+        del o_kv_cache_hbm_ref, o_lse_hbm_ref, o_in_hbm_ref
 
         q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
+            kv_cache_hbm_ref, q_hbm_ref, o_hbm_ref, lse_hbm_ref, cfgs
         )
         # The LSE output exists only with return_lse; None adds no buffer.
         lse_spec = None if lse_alloc is None else lse_alloc.spec
@@ -826,19 +833,28 @@ def rpa_kernel(
 
     num_pre_leaves = len(scalar_prefetches)
     num_sched_leaves = len(jax.tree_util.tree_leaves(schedule_hbm))
+    if (o_hbm is not None) != cfgs.serve.separate_out:
+        raise ValueError(
+            f"o_hbm must be given exactly when the output packing "
+            f"({cfgs.serve.packing_out}) differs from q's ({cfgs.serve.packing_q})"
+        )
     q_hbm_idx = num_pre_leaves + num_sched_leaves
     kv_cache_hbm_idx = q_hbm_idx + 2
-    input_output_aliases = {q_hbm_idx: 0, kv_cache_hbm_idx: 1}
+    input_output_aliases = {kv_cache_hbm_idx: 1}
+    # The optional sink table and lse_hbm follow kv_cache_hbm, then o_hbm.
+    after_kv = kv_cache_hbm_idx + 1 + int(attention_sink is not None)
     lse_hbm_spec = None
     if lse_hbm is not None:
         lse_hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-        # The optional sink table sits between kv_cache_hbm and lse_hbm.
-        lse_hbm_idx = kv_cache_hbm_idx + 1 + int(attention_sink is not None)
-        input_output_aliases[lse_hbm_idx] = 2
+        input_output_aliases[after_kv] = 2
+    if o_hbm is None:
+        input_output_aliases[q_hbm_idx] = 0
+    else:
+        input_output_aliases[after_kv + int(lse_hbm is not None)] = 0
 
     return pl.pallas_call(
         kernel,
-        out_shape=[q_hbm, kv_cache_hbm, lse_hbm],
+        out_shape=[q_hbm if o_hbm is None else o_hbm, kv_cache_hbm, lse_hbm],
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_pre_leaves,
             in_specs=[
@@ -852,6 +868,9 @@ def rpa_kernel(
                     else pl.BlockSpec(memory_space=pltpu.VMEM)
                 ),  # sink_ref
                 lse_hbm_spec,  # lse_hbm_ref
+                (
+                    None if o_hbm is None else pl.BlockSpec(memory_space=pltpu.HBM)
+                ),  # o_in_hbm_ref
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
@@ -874,4 +893,5 @@ def rpa_kernel(
         kv_cache_hbm,
         attention_sink,
         lse_hbm,
+        o_hbm,
     )

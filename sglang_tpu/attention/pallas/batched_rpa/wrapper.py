@@ -836,6 +836,7 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
         lse_hbm: jax.Array | None,
+        o_hbm: jax.Array | None,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
@@ -884,6 +885,7 @@ def ragged_paged_attention(
             lse_hbm=lse_hbm,
             cp_rank=cp_rank,
             kv_lens_global=kv_lens_global,
+            o_hbm=o_hbm,
         )
 
     if rpa_cases is None:
@@ -893,18 +895,28 @@ def ragged_paged_attention(
     else:
         active_cases = tuple(rpa_cases)
 
+    # separate_out: q stays read-only; both cases write the output buffer in place
+    o_sep = None
+    if serve_cfgs.separate_out:
+        kv_h, max_tok, q_groups, q_pack, d_al = q_hbm.shape
+        p_out = serve_cfgs.packing_out
+        o_sep = jnp.zeros(
+            (kv_h, max_tok, q_groups * q_pack // p_out, p_out, d_al), out_dtype
+        )
     o_hbm_alias_q_hbm = q_hbm
-    if configs.RpaCase.DECODE in active_cases:
-        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-            configs.RpaCase.DECODE, o_hbm_alias_q_hbm, kv_cache, lse_hbm
+    for case in (configs.RpaCase.DECODE, configs.RpaCase.MIXED):
+        if case not in active_cases:
+            continue
+        o_out, kv_cache, lse_hbm = run_rpa_kernel(
+            case, o_hbm_alias_q_hbm, kv_cache, lse_hbm, o_sep
         )
-    if configs.RpaCase.MIXED in active_cases:
-        o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-            configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-        )
+        if o_sep is None:
+            o_hbm_alias_q_hbm = o_out
+        else:
+            o_sep = o_out
 
-    # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
-    o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+    # before: [kv_heads, max_tokens, q_per_kv // packing, packing, d]
+    o_hbm = prepare_outputs(o_hbm_alias_q_hbm if o_sep is None else o_sep)
     # after: [kv_heads, max_tokens, q_per_kv, d]
 
     # slice back to original shape if padded

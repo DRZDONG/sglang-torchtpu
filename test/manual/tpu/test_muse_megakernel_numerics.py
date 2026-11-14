@@ -19,10 +19,10 @@ SGLANG_TPU_MUSE_MK_QBLOCK=256 ... --qblock-ref --served loads the fp4 experts th
 path (checkpoint layout, prepare_tpu_nvfp4_moe_weights, requant_tpu_nvfp4_experts); the
 reference requantizes the natural block-16 slabs independently.
 
---ep runs the EP megakernel (muse_megakernel/ep_mk): each rank gets its 32 whole experts and
-the replicated pool / unpool assembled from every rank's slices, in ep_mk's layout (the pooled
-width permuted as ep_mk.kernel.pooled_perm); fp8 experts then share one w2 column scale across
-slices, as a checkpoint's whole expert does. Its arm is ep_mk.config.ep_arm's
+--ep runs the EP megakernel (muse_megakernel/decode/ep): each rank gets its 32 whole experts and
+the replicated pool / unpool assembled from every rank's slices, in decode/ep's layout (the pooled
+width permuted as decode.ep.kernel.pooled_perm); fp8 experts then share one w2 column scale across
+slices, as a checkpoint's whole expert does. Its arm is decode.ep.config.ep_arm's
 (SGLANG_TPU_MUSE_MK_EP_ARM=a2a | gather forces one; a2a needs >= 64 rows).
 """
 
@@ -68,8 +68,10 @@ TOL_HID_REL = 1e-2  # final norm, computed from the captured last-layer stream
 NEAR_TIE = 2e-3
 # --ep: the EP megakernel and its weight layout (set once by main, before any weight is built)
 _EP = False
+# where the reference dequantizes and runs the experts (the prefill test: the rank's TPU)
+_REF_DEVICE = torch.device("cpu")
 # --qblock-ref: the reference reads the requantized fp4 experts the kernel reads
-# (SGLANG_TPU_EP_QBLOCK with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK)
+# (SGLANG_TPU_MUSE_MK_QBLOCK blocks, in kperm order with --ep)
 _QBLOCK_REF = False
 # --served: fp4 experts go through the serving weight load (checkpoint layout ->
 # prepare_tpu_nvfp4_moe_weights -> requant_tpu_nvfp4_experts under SGLANG_TPU_MUSE_MK_QBLOCK)
@@ -345,21 +347,23 @@ def _permute_packed_rows(
 def _requant_kperm(
     words: torch.Tensor, scale: torch.Tensor, perm: torch.Tensor, block: int
 ) -> tuple:
-    """ep_mk.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
+    """decode.ep.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
     scales [K / block, N], the requantized weights as f32 in natural order)."""
-    k, n = words.shape[0] * 8, words.shape[1]
+    k, n, dev = words.shape[0] * 8, words.shape[1], words.device
+    e2m1, perm = _E2M1[:8].to(dev), perm.to(dev)
     w = _dequant_fp4(words, scale)[perm].reshape(k // block, block, n)
     sb = (w.abs().amax(dim=1) / 6.0).to(torch.bfloat16)
     sbf = sb.float()
     q = (w / torch.where(sbf > 0, sbf, 1.0)[:, None]).clamp(-6.0, 6.0)
-    d = (q.abs()[..., None] - _E2M1[:8]).abs()
+    d = (q.abs()[..., None] - e2m1).abs()
     near = d == d.amin(dim=-1, keepdim=True)
-    idx = torch.where(near, torch.arange(8) % 2, 2).argmin(dim=-1)  # ties to even
-    deq = (torch.where(q < 0, -1.0, 1.0) * _E2M1[:8][idx] * sbf[:, None]).reshape(k, n)
+    parity = torch.arange(8, device=dev) % 2
+    idx = torch.where(near, parity, 2).argmin(dim=-1)  # ties to even
+    deq = (torch.where(q < 0, -1.0, 1.0) * e2m1[idx] * sbf[:, None]).reshape(k, n)
     codes = (idx.to(torch.int32) | torch.where(q < 0, 8, 0).to(torch.int32)).reshape(
         k // 8, 8, n
     )
-    out = torch.zeros(k // 8, n, dtype=torch.int32)
+    out = torch.zeros(k // 8, n, dtype=torch.int32, device=dev)
     for j in range(8):
         out |= codes[:, j] << (4 * j)
     return out, sb, deq[perm]
@@ -398,7 +402,9 @@ def served_expert_refs(l: int, rank: int, device: torch.device) -> list:
 
     from sglang_tpu.fp4_moe import prepare_tpu_nvfp4_moe_weights
     from sglang_tpu.moe.pallas import fused_moe_rs_op
-    from sglang_tpu.muse_megakernel.expert_requant import requant_tpu_nvfp4_experts
+    from sglang_tpu.muse_megakernel.common.expert_requant import (
+        requant_tpu_nvfp4_experts,
+    )
 
     slabs = [expert_slabs(l, rank, e, "fp4") for e in range(N_EXPERTS)]
     layer = torch.nn.Module()
@@ -435,11 +441,10 @@ def served_expert_refs(l: int, rank: int, device: torch.device) -> list:
 
 def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
     """decode_expert of one rank's slice; --qblock-ref: the requantized weights the kernel
-    reads (SGLANG_TPU_EP_QBLOCK in kperm order with --ep, else SGLANG_TPU_MUSE_MK_QBLOCK in
-    natural order)."""
-    from sglang_tpu.muse_megakernel.ep_mk.experts import kperm, qblock
+    reads (SGLANG_TPU_MUSE_MK_QBLOCK blocks, in kperm order with --ep, else natural order)."""
+    from sglang_tpu.muse_megakernel.decode.ep.experts import kperm, qblock
 
-    slabs = expert_slabs(l, rank, e, kind)
+    slabs = [t.to(_REF_DEVICE) for t in expert_slabs(l, rank, e, kind)]
     if not (_QBLOCK_REF and kind == "fp4"):
         return decode_expert(slabs, kind)
     w13, s13, w2, s2 = slabs
@@ -458,11 +463,11 @@ def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
 
 
 def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
-    """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in ep_mk's layout:
+    """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in decode/ep's layout:
     every rank's intermediate slices of each expert side by side, the hidden rows in
     pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order; then
     w13's columns in chunk_cols order."""
-    from sglang_tpu.muse_megakernel.ep_mk.experts import chunk_cols, kperm, qblock
+    from sglang_tpu.muse_megakernel.decode.ep.experts import chunk_cols, kperm, qblock
 
     el, il, he = N_EXPERTS // TP, INTER_LOCAL, EXPERT_HIDDEN
     cc = torch.from_numpy(chunk_cols(2 * TP * il, il))
@@ -507,14 +512,17 @@ def decode_expert(slabs: list, kind: str) -> tuple:
 
 
 def _dequant_fp4(words: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    shifts = torch.arange(0, 32, 4, dtype=torch.int32)[None, :, None]
+    dev = words.device
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=dev)[None, :, None]
     codes = (words[:, None, :] >> shifts) & 0xF  # nibble j of word w is row 8w + j
-    v = _E2M1[codes.long()].reshape(words.shape[0] * 8, words.shape[1])
+    v = _E2M1.to(dev)[codes.long()].reshape(words.shape[0] * 8, words.shape[1])
     return v * scale.float().repeat_interleave(16, dim=0)
 
 
 def _dequant_fp8(words: torch.Tensor) -> torch.Tensor:
-    shifts = torch.arange(0, 32, 8, dtype=torch.int32)[None, :, None]
+    shifts = torch.arange(0, 32, 8, dtype=torch.int32, device=words.device)[
+        None, :, None
+    ]
     b = ((words[:, None, :] >> shifts) & 0xFF).to(torch.uint8)
     return (
         b.view(torch.float8_e4m3fn).float().reshape(words.shape[0] * 4, words.shape[1])
@@ -687,7 +695,7 @@ class _Runner:
         if (
             _EP
         ):  # replicated pool / unpool: every rank's slices, the pooled width permuted
-            from sglang_tpu.muse_megakernel.ep_mk.kernel import pooled_perm
+            from sglang_tpu.muse_megakernel.decode.ep.kernel import pooled_perm
 
             kp = torch.from_numpy(pooled_perm(EXPERT_HIDDEN))
             for l in range(L):
@@ -989,7 +997,11 @@ class _LayerRef:
             if (r, e) not in self._y:
                 todo.setdefault(e, []).append(r)
         for e, rs in todo.items():
-            x = xe[rs]
+            # rows padded to a power of two: one compiled shape per bucket off the CPU
+            n = len(rs)
+            x = torch.zeros(max(8, 1 << (n - 1).bit_length()), xe.shape[1])
+            x[:n] = xe[rs]
+            x = x.to(_REF_DEVICE)
             y = 0
             for d in range(TP):
                 w13, w2 = ref_expert(self.l, d, e, self.kind)
@@ -997,7 +1009,7 @@ class _LayerRef:
                 gate, up = gu[:, :INTER_LOCAL], gu[:, INTER_LOCAL:]
                 h = _bf(gate * torch.sigmoid(gate) * up)
                 y = y + _bf(h @ w2)
-            y = _bf(y)
+            y = _bf(y)[:n].cpu()
             for i, r in enumerate(rs):
                 self._y[(r, e)] = y[i]
 
@@ -1125,13 +1137,29 @@ def _debug_row(ref, mid, xe, sc, ids, out, r, biased) -> None:
 
 
 def check_layer(
-    l, case, st, n_layers, global_layers, attn_mode, stream_in, out, new_kv
+    l,
+    case,
+    st,
+    n_layers,
+    global_layers,
+    attn_mode,
+    stream_in,
+    out,
+    new_kv,
+    max_ffn_rows: int | None = None,
 ) -> dict:
-    """Errors of one layer: kernel output stream vs the reference fed the kernel's input."""
+    """Errors of one layer: kernel output stream vs the reference fed the kernel's input.
+
+    max_ffn_rows: check the FFN (route, experts) on that many evenly spaced rows only; the
+    CPU expert reference of a 4096-row chunk takes most of an hour."""
     t0 = time.time()
     n = st.n_live
     ref = _LayerRef(l, case, st, n_layers, global_layers, attn_mode)
     mid, kv_ref = ref.attention_block(stream_in)
+    rows = torch.arange(n)
+    if max_ffn_rows is not None and n > max_ffn_rows:
+        rows = torch.linspace(0, n - 1, max_ffn_rows).long().unique()
+    mid, out = mid[rows], out[rows]
     xe, sc, biased = ref.route(mid)
     ids = torch.topk(biased, TOP_K, dim=1).indices
     want = ref.ffn_block(mid, xe, sc, ids)
@@ -1150,13 +1178,13 @@ def check_layer(
             if best is None or e2 < best[0]:
                 best = (e2, ids2)
         if best is not None and best[0] <= tol_row:
-            flips.append(r)
+            flips.append(int(rows[r]))
             if int((best[1][r] != ids[r]).sum()) == 2:
-                double_flips.append(r)
+                double_flips.append(int(rows[r]))
             rel[r] = best[0]
             want[r] = ref.ffn_block(mid, xe, sc, best[1])[r]
         else:
-            unexplained.append(r)
+            unexplained.append(int(rows[r]))
             if os.environ.get("MK_NUMERICS_DEBUG_ROWS") == "1":
                 _debug_row(ref, mid, xe, sc, ids, out, r, biased)
     kv_rel = _row_rel(new_kv.reshape(TP * n, -1), kv_ref.reshape(TP * n, -1))
@@ -1167,6 +1195,7 @@ def check_layer(
         "attn": "global" if l in global_layers else "swa",
         "experts": _kinds(n_layers)[l],
         "rows": n,
+        "ffn_rows_checked": len(rows),
         "max_row_rel": float(rel.max()),
         "mean_row_rel": float(rel.mean()),
         "max_abs": float(diff.max()),
@@ -1370,8 +1399,8 @@ def main() -> None:
     # The AOTAutograd key misses the kernel config the op picks while tracing: a persistent
     # entry (TORCHINDUCTOR_CACHE_DIR, /tmp/torchinductor_* by default) replays without tracing
     torch.compiler.config.force_disable_caches = True
-    from sglang_tpu.muse_megakernel import kernel as K
     from sglang_tpu.muse_megakernel import ops
+    from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 
     cases = [CASES[c] for c in args.cases]
     base = dict(_parse_flag(f) for f in args.base_cfg)
