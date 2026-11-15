@@ -570,7 +570,7 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_OPT = EnvBool(True)
     # Muse megakernels (decode TP / EP, prefill): fp4 experts requantized at load to one bf16
     # scale per this many K rows (0 off, 256), shared with the native fused-RS MoE (W4A16); the
-    # expert dots push raw e2m1 codes to the MXU (MKConfig.qblock, decode.ep.experts.qblock).
+    # expert dots push raw e2m1 codes to the MXU (MKConfig.qblock, common.ep_layout.qblock).
     SGLANG_TPU_MUSE_MK_QBLOCK = EnvInt(0)
     # Muse megakernel: extend and mixed steps run the prefill program (muse_megakernel/prefill/)
     # on the kernel's weights. Needs TP 8, fp8 SEQ_ALONG_LANE pools, pallas_tpu_rpa_batched
@@ -579,12 +579,24 @@ class TpuEnvs:
     # Prefill program: the expert-input and post-expert-projection all-gathers in e4m3, one
     # scale per block: half their ICI bytes, ~2^-4 relative error per element.
     SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER = EnvBool(False)
-    # Prefill program in the sequence-parallel layout (prefill/sp): each rank owns rows / tp of
+    # Prefill program in the sequence-parallel layout (prefill/spep): each rank owns rows / tp of
     # the chunk between layers, instead of every rank holding every row (prefill/tp).
     SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
     # Debug (numerics A/B): the SP program's dense activations (a_in, gated attention, ffn, u)
     # stay f32 instead of e4m3 rows; dispatch stays e4m3 (the expert gmm requantizes anyway).
     SGLANG_TPU_MUSE_MK_PREFILL_SP_DEBUG_HP = EnvBool(False)
+    # SP program: o-proj on this rank's heads (its row block of the replicated wo, the layout
+    # SP prefill shares) then a bf16 reduce-scatter by row (the decode SP + EP target,
+    # comm_overview (8)) instead of the row all-to-all + whole wo ((3)).
+    SGLANG_TPU_MUSE_MK_SP_O_RS = EnvBool(False)
+    # SP program: pooler / unpooler on this rank's column slice of the replicated weights for
+    # every row (e4m3 AG in, bf16 row all-to-all out; comm_overview (9)) instead of the whole
+    # weights on own rows: 8 instead of 64 MiB of weight reads per layer, for the decode target.
+    SGLANG_TPU_MUSE_MK_SP_COL_POOL = EnvBool(False)
+    # SP program reads decode EP's expert layout (decode/spep: pooled width and fp4 K rows in
+    # kperm order, w13 columns as per-chunk [gate | up]) so prefill SP and both decode paths
+    # share one copy of the weights; w13 then runs unfused (silu * up after the gmm).
+    SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT = EnvBool(False)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
@@ -599,13 +611,13 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
     # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
     SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
-    # Largest EP block-diagonal arm in rows (decode/ep/experts.BD_ARMS).
+    # Largest EP block-diagonal arm in rows (decode/spep/experts.BD_ARMS).
     SGLANG_TPU_EP_BD_MAX = EnvInt(None)
     # Rows from which EP all-gathers relay through the partner core (gather.PAIR_AG_MIN_ROWS).
     SGLANG_TPU_EP_GATHER_PAIR_MIN_ROWS = EnvInt(None)
     # EP megakernel without Pallas bounds checks.
     SGLANG_TPU_EP_NO_BOUNDS = EnvBool(False)
-    # Timing only (wrong results): comma-separated EP phases every rank skips (decode/ep/layer.py).
+    # Timing only (wrong results): comma-separated EP phases every rank skips (decode/spep/layer.py).
     SGLANG_TPU_EP_DEV_SKIP = EnvStr("")
 
     @classmethod

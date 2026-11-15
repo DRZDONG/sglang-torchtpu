@@ -7,7 +7,7 @@ Between layers rank m owns rows [m * Ts, (m + 1) * Ts) of the chunk (Ts = rows /
       -> gated output of every row --a2a by row (e4m3 + row scale)--> own rows, every head
       -> o proj on own rows (replicated wo) and the attention residual
       -> router and replicated pool on own rows
-      -> each (row, slot) --remote-DMA a2a (a2a.py: e4m3 + row scale, expert-grouped)--> its
+      -> each (row, slot) --remote-DMA a2a (common/a2a.py: e4m3 + row scale, expert-grouped)--> its
          expert's rank (E / tp whole experts) -> grouped whole-expert FFN, streamed per expert
          chunk --remote-DMA a2a (bf16)--> the row owner
       -> post-expert norm, weighted sum, replicated unpool and FFN residual on own rows
@@ -25,11 +25,11 @@ natural order (w13's columns: all gate, then all up), scales [E/tp, K / block, 1
 import jax
 import jax.numpy as jnp
 
+from sglang_tpu.muse_megakernel.common import a2a
+from sglang_tpu.muse_megakernel.common.config import PFConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE, small_row
 from sglang_tpu.muse_megakernel.common.numerics import _heads_rms, _rms, _topk_iter
-from sglang_tpu.muse_megakernel.prefill.sp import a2a
-from sglang_tpu.muse_megakernel.prefill.tp.config import PFConfig
-from sglang_tpu.muse_megakernel.prefill.tp.post_moe import qkv_from_proj
+from sglang_tpu.muse_megakernel.common.qkv import qkv_from_proj
 
 # dtype instances: RPA / gmm_v2 configs read .itemsize
 _F32, _BF16, _FP8 = (
@@ -92,6 +92,11 @@ def build_forward(c: PFConfig, axis: str = "model"):
     cap = T * K + G * (a2a.SEG - 1) + El * (a2a.GROUP_ALIGN - 1)
     cap = -(-cap // a2a.UNPACK_ROWS) * a2a.UNPACK_ROWS
     xchg = a2a.exchange(tp, cap, Pp, He)
+    # decode-sized steps (swept on v7x, 6 layers, ctx 4096): few rows per expert want a small
+    # tile_m (R=16 / 64: 64 beat 256 by 12% / 4%), and at 16 rows the chunk pipeline has no
+    # transfer to hide (R=16: 1 chunk 0.48 vs 4 chunks 0.72 ms/layer; R=32 / 64: 4 chunks win)
+    expert_tiles = (64,) + EXPERT_TILES[1:] if T <= 1024 else EXPERT_TILES
+    n_chunks = 1 if T <= 16 else N_CHUNKS
 
     def ag(x):
         return jax.lax.all_gather(x, axis, axis=0, tiled=True)
@@ -103,6 +108,19 @@ def build_forward(c: PFConfig, axis: str = "model"):
         b = jax.lax.all_to_all(b, axis, 0, 0, tiled=True).reshape(tp, Ts, -1)
         b = b.transpose(1, 0, 2)
         return jax.lax.bitcast_convert_type(b, _FP8) if x.dtype == _FP8 else b
+
+    def col_dense(x8, xs, w, sm, name: str, n: int, me):
+        """dense on own rows with the work split by output column instead of by row: every
+        row (e4m3 AG) times this rank's n / tp columns of the replicated w, back to the row
+        owners by a bf16 all-to-all -> f32 [Ts, n]. Reads n / tp columns of w, not n."""
+        nc = n // tp
+        w_me = jax.lax.dynamic_slice_in_dim(w, me * nc, nc, axis=1)
+        s_me = jax.lax.dynamic_slice_in_dim(
+            small_row(sm, name + "_s")[:, :n], me * nc, nc, 1
+        )
+        y = jnp.dot(ag(x8), w_me, preferred_element_type=_F32) * ag(xs) * s_me
+        # [Ts, tp, nc]: own rows, rank r's columns in block r
+        return to_owner(y.astype(_BF16)).astype(_F32).reshape(Ts, n)
 
     def rows8(x):
         """_fp8_rows, or (x, 1) with sp_debug_hp."""
@@ -151,7 +169,9 @@ def build_forward(c: PFConfig, axis: str = "model"):
             jnp.sum(w, axis=1, keepdims=True) + c.router_eps
         ) * c.route_scale
 
-    def expert_ffn(kind: str, x, group_sizes, w13, s13, w2, s2, group_offset=None):
+    def expert_ffn(
+        kind: str, x, group_sizes, w13, s13, w2, s2, group_offset=None, rows=(0, None)
+    ):
         """silu(x @ gate) * (x @ up) @ w2 over rows grouped by local expert -> bf16 [cap, He].
         gmm_v2 quantizes x and h to e4m3 (W4A8 / W8A8) and accumulates in f32."""
         q_dtype = jnp.float4_e2m1fn if kind == "fp4" else jnp.float8_e4m3fn
@@ -169,21 +189,33 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 rhs_quant_dtype=q_dtype,
                 maybe_quantize_lhs=True,
                 fuse_act=fuse_act,
-                tile_info=TileSizes(*EXPERT_TILES),
+                tile_info=TileSizes(*expert_tiles),
             )
 
-        # silu(gate) * up in the w13 kernel's epilogue
-        return gmm(gmm(x, w13, s13, fuse_act="silu"), w2, s2)
+        if s13.ndim == 3:  # [E, K / block, N] -> gmm_v2's [E, K / block, 1, N]
+            s13, s2 = s13[:, :, None, :], s2[:, :, None, :]
+        if not c.sp_ep_layout:
+            # silu(gate) * up in the w13 kernel's epilogue
+            return gmm(gmm(x, w13, s13, fuse_act="silu"), w2, s2)
+        # decode EP layout: w13 columns are per-chunk [gate | up] (decode/spep chunk_cols, chunk
+        # = I / tp), which the fused silu cannot read; split them after an unfused gmm. Gate /
+        # up come out in w2's row order (kperm for fp4, natural for fp8).
+        h = gmm(x, w13, s13)
+        lo, hi = rows
+        act = a2a.silu_mul_chunks(
+            h, lo, h.shape[0] if hi is None else hi, w13.shape[-1] // (2 * tp)
+        )
+        return gmm(act, w2, s2)
 
     def moe(l, me, xe8, xs, ids, experts):
         """Own rows' expert outputs [Ts, top_k, He] bf16: each (row, slot)'s e4m3 input (row
-        scale xs) to its expert's rank and back by streamed remote-DMA all-to-alls (a2a.py):
+        scale xs) to its expert's rank and back by streamed remote-DMA all-to-alls (common/a2a.py):
         chunk j's expert FFN runs while chunk j + 1 arrives and chunk j - 1 returns."""
         flat = ids.reshape(P)
         # by global expert: rank, then local expert
         order = jnp.argsort(flat, stable=True)
         sorted_ids = flat[order]
-        pln = a2a.plan(ag(_counts(sorted_ids, G)[None]), me, tp, El, N_CHUNKS)
+        pln = a2a.plan(ag(_counts(sorted_ids, G)[None]), me, tp, El, n_chunks)
         rows = a2a.padded_rows(pln, sorted_ids)
         me1 = me.reshape(1)
         # padded send row -> own row; padding rows read row 0 and are never read back
@@ -191,10 +223,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
         send = a2a.pack_rows(xe8, xs)[src]
         recv, *dsems = xchg.dispatch_send(pln.dispatch, me1, send)
         back, csems, ccnts, ys = None, [], [], []
-        for j in range(N_CHUNKS):
+        for j in range(n_chunks):
             # chunk j's arrivals; the last wait also drains this rank's sends
             sems, cnts, keep = [dsems[2 * j]], [pln.dispatch_counts[j, 0]], ()
-            if j == N_CHUNKS - 1:
+            if j == n_chunks - 1:
                 sems += dsems[1::2]
                 cnts += list(pln.dispatch_counts[:, 1])
                 keep = (send,)
@@ -203,9 +235,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
             y = expert_ffn(
                 c.expert_kinds[l],
                 a2a.unpack_rows(recv, lo, hi, He),
-                a2a.chunk_group_sizes(pln, j, N_CHUNKS),
+                a2a.chunk_group_sizes(pln, j, n_chunks),
                 *experts[4 * l : 4 * l + 4],
                 group_offset=jnp.ones((1,), jnp.int32),
+                rows=(lo, hi),
             )
             tab = pln.combine[j : j + 1]
             if back is None:
@@ -269,22 +302,38 @@ def build_forward(c: PFConfig, axis: str = "model"):
             o, kv[l] = attention(l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             attn = _heads_rms(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
             g8, g_s = rows8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
-            # own rows' every head, then the o-proj locally on the whole wo: no partial sums
-            g = (to_owner(g8).astype(_F32) * to_owner(g_s)).reshape(Ts, tp * qd)
-            g8, g_s = rows8(g)
-            stream = residual(stream, sm, "attn", dense(g8, g_s, wo[l], sm, "wo", H))
+            if c.sp_o_rs:
+                # (8): o-proj partial on this rank's heads (its row block of the replicated wo
+                # prefill reads whole: one weight layout for both), bf16 RS by row
+                w_me = jax.lax.dynamic_slice_in_dim(wo[l], me * qd, qd, axis=0)
+                o_part = dense(g8, g_s, w_me, sm, "wo", H).astype(_BF16)
+                a = jax.lax.psum_scatter(o_part, axis, scatter_dimension=0, tiled=True)
+                stream = residual(stream, sm, "attn", a.astype(_F32))
+            else:
+                # (3): own rows' every head, then the o-proj on the whole wo: no partial sums
+                g = (to_owner(g8).astype(_F32) * to_owner(g_s)).reshape(Ts, tp * qd)
+                g8, g_s = rows8(g)
+                stream = residual(
+                    stream, sm, "attn", dense(g8, g_s, wo[l], sm, "wo", H)
+                )
 
             ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
             # router input stays bf16 until the GSM8K A/B settles its dtype
             ids, tw = route(ffn.astype(_BF16), wrouter[l], sm)
             f8, f_s = rows8(ffn)
-            pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
+            if c.sp_col_pool:
+                pooled = col_dense(f8, f_s, wpool[l], sm, "wpool", He, me)
+            else:
+                pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
             xe8, xs = _fp8_rows(
                 _rms(pooled, c.rms_eps) * small_row(sm, "pre_expert_w")[:, :He]
             )
             u8, u_s = rows8(combine(moe(l, me, xe8, xs, ids, experts), tw, sm))
             # bf16: the unpool output feeds the post-FFN norm
-            f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
+            if c.sp_col_pool:
+                f = col_dense(u8, u_s, wunpool[l], sm, "wunpool", H, me).astype(_BF16)
+            else:
+                f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
             stream = residual(
                 stream, sm, "ffn", f.astype(_F32) * small_row(sm, "post_ffn_w")
             )

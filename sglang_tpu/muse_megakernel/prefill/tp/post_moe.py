@@ -19,13 +19,14 @@ from sglang_tpu.muse_megakernel.common.coll import (
     run_pipeline,
     to_fp8,
 )
+from sglang_tpu.muse_megakernel.common.config import PFConfig
 from sglang_tpu.muse_megakernel.common.consts import (
     LANE,
     PREFILL_POST_MOE_COLLECTIVE_ID,
     small_row,
 )
-from sglang_tpu.muse_megakernel.common.numerics import _heads_rms, _rms, _rope_roll
-from sglang_tpu.muse_megakernel.prefill.tp.config import PFConfig
+from sglang_tpu.muse_megakernel.common.numerics import _rms
+from sglang_tpu.muse_megakernel.common.qkv import attention_inputs
 
 # Pad slots, checked against the peers' wait chains of the two-phase all-gathers.
 _SLOTS = 5
@@ -247,35 +248,3 @@ def post_moe_call(c: PFConfig, tm: int, *, next_rope: bool | None, axis: str = "
         )(lyr, y, x, rope, wu, sm, wq)
 
     return call
-
-
-def attention_inputs(c: PFConfig, x, smn, wq, rope):
-    """A layer's (q, kv, gate) rows from its input stream x; rope None: a NoPE layer."""
-    return qkv_from_input(c, attention_input(c, x, smn), smn, wq, rope)
-
-
-def attention_input(c: PFConfig, x, smn):
-    """The pre-attention norm of stream rows x, bf16."""
-    return (_rms(x, c.rms_eps) * small_row(smn, "pre_attn_w")).astype(jnp.bfloat16)
-
-
-def qkv_from_input(c: PFConfig, a_in, smn, wq, rope):
-    """(q, kv, gate) rows from pre-attention-normed rows a_in; rope None: a NoPE layer."""
-    qkvg = jnp.dot(a_in, wq, preferred_element_type=jnp.float32)
-    return qkv_from_proj(c, qkvg * small_row(smn, "wqkvg_s")[:, : c.qkvg_dim], rope)
-
-
-def qkv_from_proj(c: PFConfig, qkvg, rope):
-    """(q, kv, gate) rows (bf16) from the f32 qkvg projection; rope None: a NoPE layer."""
-    qd, kvd, hd = c.q_dim, c.kv_dim, c.head_dim
-    q = _heads_rms(qkvg[:, :qd], c.q_heads, hd, c.rms_eps, gain=c.scale_query_by)
-    k = _heads_rms(qkvg[:, qd : qd + kvd], c.kv_heads, hd, c.rms_eps)
-    if rope is not None:
-        q = _rope_roll(q, c.q_heads, hd, rope[:, :hd], rope[:, hd:])
-        k = _rope_roll(k, c.kv_heads, hd, rope[:, :hd], rope[:, hd:])
-    kv = jnp.concatenate([k, qkvg[:, qd + kvd : qd + 2 * kvd]], axis=1)
-    return (
-        q.astype(jnp.bfloat16),
-        kv.astype(jnp.bfloat16),
-        qkvg[:, qd + 2 * kvd :].astype(jnp.bfloat16),
-    )

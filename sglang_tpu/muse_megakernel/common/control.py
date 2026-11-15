@@ -44,6 +44,26 @@ def _select(idx, keys, fn):
     )
 
 
+def for_layer_experts(l, kind, layer_ex, kind_layers, group_lo, fn):
+    """fn(refs, off) on layer l's expert refs: one branch-tree walk over stacked groups (off:
+    the layer's index in the group) or single layers (off None)."""
+    if isinstance(l, int):
+        fn(*layer_ex[l])
+        return
+    keys = sorted(
+        {
+            li if layer_ex[li][1] is None else li - layer_ex[li][1]
+            for li in kind_layers[kind]
+        }
+    )
+
+    def leaf(k):
+        refs, _ = layer_ex[k]
+        fn(refs, l - k if k in group_lo else None)
+
+    _select(l, keys, leaf)
+
+
 def _dispatch(idx, refs, fn, only=None):
     """Run ``fn(ref)`` on ``refs[idx]``; a traced index goes through ``_branch``.
 

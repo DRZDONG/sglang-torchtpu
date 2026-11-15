@@ -30,16 +30,16 @@ from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL, small_row
 from sglang_tpu.muse_megakernel.common.hooks import EPLayerStep, EPOProjStep
 from sglang_tpu.muse_megakernel.common.numerics import _rms
 from sglang_tpu.muse_megakernel.common.packing import _pack_bf16x2, _unpack_bf16x2
-from sglang_tpu.muse_megakernel.decode.ep import route
-from sglang_tpu.muse_megakernel.decode.ep.config import (
+from sglang_tpu.muse_megakernel.decode.spep import route
+from sglang_tpu.muse_megakernel.decode.spep.config import (
     EPPlan,
     ep_buffers,
     gather_plan,
     item_scratch,
 )
-from sglang_tpu.muse_megakernel.decode.ep.dense import stream_matmul, stream_prefetch
-from sglang_tpu.muse_megakernel.decode.ep.experts import item_sizes, sized
-from sglang_tpu.muse_megakernel.decode.ep.layer import _phase, expert_loop
+from sglang_tpu.muse_megakernel.decode.spep.dense import stream_matmul, stream_prefetch
+from sglang_tpu.muse_megakernel.decode.spep.experts import item_sizes, sized
+from sglang_tpu.muse_megakernel.decode.spep.layer import _phase, expert_loop
 
 f32, bf16 = jnp.float32, jnp.bfloat16
 

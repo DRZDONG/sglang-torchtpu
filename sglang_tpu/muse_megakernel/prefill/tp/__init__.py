@@ -13,11 +13,6 @@ ops.MuseMegakernel registers it as the sglang_tpu_pallas::muse_prefill op
 (SGLANG_TPU_MUSE_MK_PREFILL).
 """
 
-from sglang_tpu.muse_megakernel.prefill.tp.config import (  # noqa: F401
-    PREFILL_TP,
-    ROW_ALIGN,
-    PFConfig,
-)
 from sglang_tpu.muse_megakernel.prefill.tp.program import (  # noqa: F401
     N_STEP_ARGS,
     build_forward,

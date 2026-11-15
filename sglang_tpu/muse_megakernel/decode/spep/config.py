@@ -11,14 +11,18 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.muse_megakernel.common.a2a import SEG  # noqa: F401 (re-export)
 from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE
 from sglang_tpu.muse_megakernel.common.plan import fit_ring_slots
-from sglang_tpu.muse_megakernel.decode.ep.experts import BD_KC, item_sizes, scale_group
+from sglang_tpu.muse_megakernel.decode.spep.experts import (
+    BD_KC,
+    item_sizes,
+    scale_group,
+)
 
 ARMS = ("a2a", "gather")
 TAB_ROWS = 32  # route.slot_tables' rows
-SEG = 8  # a2a segments start on 8-row (HBM tile) boundaries and move in 8-row DMAs
 DN_TK, DN_TN = 2048, 1024  # a replicated pool / unpool tile: one fp4 expert-ring slot
 
 
@@ -92,7 +96,7 @@ def ep_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
         raise ValueError(
             "the EP a2a arm runs the row-tiled program (MuseMegakernel.moe_mode ep)"
         )
-    assert not c.scale_fp8 and c.n_experts % c.tp == 0 and c.rows % c.tp == 0
+    assert c.n_experts % c.tp == 0 and c.rows % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
     assert c.n_experts_padded == c.n_experts and c.expert_hidden % DN_TN == 0
     assert c.hidden % DN_TK == 0 and c.expert_hidden % DN_TK == 0
@@ -122,7 +126,7 @@ def gather_plan(c: MKConfig, item_rows: int = 32) -> EPPlan:
         raise ValueError(
             "the EP gather arm runs the row-tiled program (MuseMegakernel.moe_mode ep)"
         )
-    assert not c.scale_fp8 and c.n_experts % c.tp == 0
+    assert c.n_experts % c.tp == 0
     assert c.inter_local % BD_KC == 0 and c.expert_hidden % BD_KC == 0
     assert c.n_experts_padded == c.n_experts and c.hidden // c.hidden_local == c.tp
     assert c.expert_hidden % (2 * LANE * c.tp) == 0 and c.hidden % DN_TK == 0

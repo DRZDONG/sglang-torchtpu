@@ -7,7 +7,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
-from sglang_tpu.muse_megakernel.common.packing import _quant_fp8_rows
 from sglang_tpu.muse_megakernel.common.plan import _PACK
 from sglang_tpu.muse_megakernel.common.trace import _scope
 
@@ -27,11 +26,8 @@ class _WeightStream:
     tile's dtype.
     """
 
-    def __init__(
-        self, W, buf, sems, tiles, depth, col_rot=None, k_rot=None, fp8_lhs=False
-    ):
+    def __init__(self, W, buf, sems, tiles, depth, col_rot=None, k_rot=None):
         self.W, self.buf, self.sems = W, buf, sems
-        self.fp8_lhs = fp8_lhs
         # name -> traced shift: column tile ni of that weight streams physical column
         # (ni + shift) % n_cols (a per-device order)
         self.col_rot = col_rot or {}
@@ -142,17 +138,7 @@ class _WeightStream:
                     w = self.buf.at[u % self.slots].bitcast(dt)[
                         pl.ds(r0, bw), pl.ds(0, tn)
                     ]
-                    if (
-                        self.fp8_lhs
-                        and jnp.dtype(dt) == jnp.dtype(jnp.float8_e4m3fn)
-                        and lhs.shape[0] >= 32
-                    ):
-                        xf_d, xsc_d = _quant_fp8_rows(lhs)
-                        part = (
-                            jnp.dot(xf_d, w, preferred_element_type=jnp.float32) * xsc_d
-                        )
-                    else:
-                        part = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
+                    part = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
                     acc[name][ni] = (
                         part if acc[name][ni] is None else acc[name][ni] + part
                     )
@@ -190,11 +176,7 @@ class _WeightStream:
             _, ki, ni, _, _, _ = self.tiles[t]
             w = self.buf.at[t % self.slots].bitcast(dt)[pl.ds(0, tk), pl.ds(0, tn)]
             lhs_s = xb[:, ki * tk : (ki + 1) * tk]
-            if self.fp8_lhs and is_fp8 and xb.shape[0] >= 32:
-                xf_d, xsc_d = _quant_fp8_rows(lhs_s)
-                part = jnp.dot(xf_d, w, preferred_element_type=jnp.float32) * xsc_d
-            else:
-                part = jnp.dot(lhs_s, w, preferred_element_type=jnp.float32)
+            part = jnp.dot(lhs_s, w, preferred_element_type=jnp.float32)
             cols[ni] = part if cols[ni] is None else cols[ni] + part
             self.refill(l, t, next_l)
             if on_col is not None and ki == nk - 1:

@@ -19,6 +19,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu.muse_megakernel.common import a2a
 from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import (
     FP4_GROUP,
@@ -26,23 +27,23 @@ from sglang_tpu.muse_megakernel.common.consts import (
     SMALL,
     small_row,
 )
+from sglang_tpu.muse_megakernel.common.ep_layout import qblock
 from sglang_tpu.muse_megakernel.common.hooks import EPLayerStep, EPOProjStep
 from sglang_tpu.muse_megakernel.common.numerics import _rms
 from sglang_tpu.muse_megakernel.common.packing import _pack_bf16x2, _unpack_bf16x2
-from sglang_tpu.muse_megakernel.decode.ep import a2a, attn, route
-from sglang_tpu.muse_megakernel.decode.ep.config import (
+from sglang_tpu.muse_megakernel.decode.spep import attn, route
+from sglang_tpu.muse_megakernel.decode.spep.config import (
     DN_TN,
     EPPlan,
     ep_buffers,
     ep_plan,
     ep_scratch,
 )
-from sglang_tpu.muse_megakernel.decode.ep.dense import stream_matmul, stream_prefetch
-from sglang_tpu.muse_megakernel.decode.ep.experts import (
+from sglang_tpu.muse_megakernel.decode.spep.dense import stream_matmul, stream_prefetch
+from sglang_tpu.muse_megakernel.decode.spep.experts import (
     ChunkRefs,
     chunk_compute,
     item_sizes,
-    qblock,
     scale_group,
     sized,
 )
@@ -120,20 +121,20 @@ class EPExperts:
         moving = not _dev_skip("a2a")
         with _phase("counts"):
             if moving:
-                a2a.exchange_counts(c, S, me)
+                a2a.mk_exchange_counts(c, S, me)
             else:
                 S["ep_cnt_v"][...] = jnp.zeros(S["ep_cnt_v"].shape, jnp.int32)
             route.slot_tables(c, p, S, me)
         with _phase("dispatch"):
             if moving:
-                a2a.dispatch(c, S, me)
+                a2a.mk_dispatch(c, S, me)
         with _phase("items"):
             n_items = route.build_items(c, p, S)
 
         def dispatched():
             with _phase("dispatch_wait"):
                 if moving:
-                    a2a.wait_dispatch(c, S, me)
+                    a2a.mk_wait_dispatch(c, S, me)
 
         with _phase("experts"):
             expert_loop(step, p, n_items, dispatched)
@@ -143,7 +144,7 @@ class EPExperts:
             )
         with _phase("combine_a2a"):
             if moving:
-                a2a.wait_give_back(c, S, me)
+                a2a.mk_wait_give_back(c, S, me)
         with _phase("combine"):
             _combine(step, win)
         with _phase("unpool"):

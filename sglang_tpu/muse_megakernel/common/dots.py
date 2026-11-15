@@ -27,46 +27,6 @@ def _dequant_fp4(words, scale, via_fp8=False):
     return v * s
 
 
-def _dequant_fp4_kperm(words, scale, via_fp8=False, out_fp8=False, vec=False):
-    """Zero-shuffle NVFP4 dequant for K permuted as (B, r=16, g=16).
-
-    ``out_fp8``: the dequantized weights go to the MXU as e4m3 (ex_kperm >= 3: the
-    block scales are normalized so every weight is at most WFP8_TARGET_MAX).
-    """
-    cw, n = words.shape
-    if vec and out_fp8 and cw == 64:
-        # Dequantize two 32-word (256-row) halves sequentially into fp8 so peak bf16
-        # live registers stay [256, n] (32 vregs at n=256) instead of [512, n] (64 vregs).
-        w0 = _dequant_fp4_kperm(
-            words[:32], scale[:16], via_fp8=via_fp8, out_fp8=True, vec=True
-        )
-        w1 = _dequant_fp4_kperm(
-            words[32:], scale[16:], via_fp8=via_fp8, out_fp8=True, vec=True
-        )
-        return jnp.concatenate([w0, w1], axis=0)
-    nb = cw // 32
-    f4 = pltpu.bitcast(words, jnp.float4_e2m1fn)
-    v = (
-        f4.astype(jnp.float8_e4m3fn).astype(jnp.bfloat16)
-        if via_fp8
-        else f4.astype(jnp.bfloat16)
-    )
-    s = scale if scale.dtype == jnp.bfloat16 else scale.astype(jnp.bfloat16)
-    if vec:
-        res = (v.reshape(nb, 16, 16, n) * s.reshape(nb, 1, 16, n)).reshape(
-            cw * FP4_PACK, n
-        )
-    else:
-        parts = []
-        for b in range(nb):
-            sb = s[b * 16 : (b + 1) * 16]
-            base = b * 256
-            for r in range(16):
-                parts.append(v[base + r * 16 : base + (r + 1) * 16] * sb)
-        res = jnp.concatenate(parts, axis=0)
-    return res.astype(jnp.float8_e4m3fn) if out_fp8 else res
-
-
 def _scale_rows(sslot, g0, gn, N, blk, n0=0):
     """Scale rows [g0, g0 + gn) of a slab as f32.
 
@@ -185,16 +145,12 @@ def _fp4_dot(
     N,
     chunk_words,
     fast_bf16=False,
-    kperm=0,
     via_fp8=False,
-    vec_dequant=False,
-    fp8_lhs=False,
     n_tile=0,
     lhs_chunk_fn=None,
     prequant_sc=None,
     out_stage_ref=None,
     post_scale=None,
-    force_bf16_w=False,
     nrows=None,
     qblock=0,
 ):
@@ -214,39 +170,12 @@ def _fp4_dot(
             nrows,
         )
     kw = K // FP4_PACK
-    m_rows = (
-        nrows
-        if nrows is not None
-        else (
-            x.shape[0]
-            if x is not None
-            else (out_stage_ref.shape[0] if out_stage_ref is not None else 0)
-        )
-    )
-    can_fp8_m = m_rows >= 32 and m_rows % 32 == 0
-    use_fp8_lhs = (fp8_lhs or prequant_sc is not None) and kperm >= 3 and can_fp8_m
-    if kperm > 0:
-        # Native fp8 x fp8 vmatmul.e4m3 contracts K = 512 (64 words) per MXU pass.
-        chunk_words = min(kw, 64 if use_fp8_lhs else (32 if vec_dequant else 64))
-    elif fast_bf16:
+    if fast_bf16:
         chunk_words = min(kw, 32)
-    use_bf16 = (fast_bf16 or kperm > 0) and not use_fp8_lhs
-    xf = x_sc = xb = None
-    if lhs_chunk_fn is None:
-        if use_fp8_lhs and prequant_sc is None:
-            xf, x_sc = _quant_fp8_rows(x)
-        elif use_fp8_lhs:
-            xf, x_sc = x, prequant_sc
-        else:
-            xb = (
-                (x if x.dtype == jnp.bfloat16 else x.astype(jnp.bfloat16))
-                if use_bf16
-                else None
-            )
-    else:
-        x_sc = prequant_sc
-    out_fp8_w = (kperm >= 3) and not (force_bf16_w and not use_fp8_lhs)
-    direct_bf16 = (use_bf16 or use_fp8_lhs) and sslot.dtype == jnp.bfloat16
+    xb = None
+    if lhs_chunk_fn is None and fast_bf16:
+        xb = x if x.dtype == jnp.bfloat16 else x.astype(jnp.bfloat16)
+    direct_bf16 = fast_bf16 and sslot.dtype == jnp.bfloat16
     tn_step = max(256, n_tile // 4) if (n_tile > 0 and N > 512) else N
     cols = [] if out_stage_ref is None else None
     for n0 in range(0, N, tn_step):
@@ -260,31 +189,16 @@ def _fp4_dot(
                 sc = sslot[pl.ds(g0, gq), pl.ds(n0, tn)]
             else:
                 sc, blk = _scale_rows(sslot, g0, gq, tn, blk, n0=n0)
-            if kperm > 0:
-                w = _dequant_fp4_kperm(
-                    wslot[pl.ds(c, cw), pl.ds(n0, tn)],
-                    sc,
-                    via_fp8=(via_fp8 or kperm >= 2),
-                    out_fp8=out_fp8_w,
-                    vec=vec_dequant,
-                )
-            else:
-                w = _dequant_fp4(
-                    wslot[pl.ds(c, cw), pl.ds(n0, tn)], sc, via_fp8=via_fp8
-                )
+            w = _dequant_fp4(wslot[pl.ds(c, cw), pl.ds(n0, tn)], sc, via_fp8=via_fp8)
             if lhs_chunk_fn is not None:
-                lhs = lhs_chunk_fn(c, cw, use_fp8_lhs)
-            elif use_fp8_lhs:
-                lhs = xf[:, c * FP4_PACK : (c + cw) * FP4_PACK]
+                lhs = lhs_chunk_fn(c, cw, False)
             elif xb is not None:
                 lhs = xb[:, c * FP4_PACK : (c + cw) * FP4_PACK]
             else:
                 lhs = x[:, c * FP4_PACK : (c + cw) * FP4_PACK].astype(jnp.bfloat16)
             part = jnp.dot(lhs, w, preferred_element_type=jnp.float32)
             acc = part if acc is None else acc + part
-        if use_fp8_lhs and x_sc is not None:
-            acc = acc * (x_sc * post_scale if post_scale is not None else x_sc)
-        elif post_scale is not None:
+        if post_scale is not None:
             acc = acc * post_scale
         if out_stage_ref is not None:
             out_stage_ref[:, pl.ds(n0, tn)] = (
@@ -307,7 +221,6 @@ def _fp4_blockdiag_dot(
     kperm=False,
     fp8_lhs=False,
     n_tile=0,
-    lhs_chunk_fn=None,
     prequant_sc=None,
     nrows=None,
     post_scale=None,
@@ -319,7 +232,7 @@ def _fp4_blockdiag_dot(
     ``fp8_lhs``). qblock: the slab is block-scaled instead and A rows run a plain dot.
     """
     if qblock:
-        if prequant_sc is not None or lhs_chunk_fn is not None:
+        if prequant_sc is not None:
             raise ValueError("qblock fp4 dots take a bf16 LHS (no prequantized fp8 x)")
         return _fp4_qblock_dot(
             xc, wslot, sslot, K, N, qblock, post_scale=post_scale, nrows=nrows
@@ -340,22 +253,16 @@ def _fp4_blockdiag_dot(
     )
     can_fp8_m = A >= 32 and A % 32 == 0
     use_fp8_lhs = (fp8_lhs or prequant_sc is not None) and can_fp8_m
-    if lhs_chunk_fn is None:
-        if use_fp8_lhs and prequant_sc is None:
-            xf, x_sc = _quant_fp8_rows(xc)
-        elif use_fp8_lhs:
-            xf, x_sc = xc, prequant_sc
-        else:
-            xf = x_sc = None
+    if use_fp8_lhs and prequant_sc is None:
+        xf, x_sc = _quant_fp8_rows(xc)
+    elif use_fp8_lhs:
+        xf, x_sc = xc, prequant_sc
     else:
-        xf = None
-        x_sc = prequant_sc
+        xf = x_sc = None
     z_lhs = jnp.zeros((rows, kc), jnp.float8_e4m3fn if use_fp8_lhs else jnp.bfloat16)
 
     def make_lhs(c0):
-        if lhs_chunk_fn is not None:
-            xs = lhs_chunk_fn(c0 // FP4_PACK, kc // FP4_PACK, use_fp8_lhs)
-        elif use_fp8_lhs:
+        if use_fp8_lhs:
             xs = xf[:, c0 : c0 + kc]
         else:
             xs = xc[:, c0 : c0 + kc].astype(jnp.bfloat16)

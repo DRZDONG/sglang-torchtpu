@@ -19,10 +19,10 @@ SGLANG_TPU_MUSE_MK_QBLOCK=256 ... --qblock-ref --served loads the fp4 experts th
 path (checkpoint layout, prepare_tpu_nvfp4_moe_weights, requant_tpu_nvfp4_experts); the
 reference requantizes the natural block-16 slabs independently.
 
---ep runs the EP megakernel (muse_megakernel/decode/ep): each rank gets its 32 whole experts and
-the replicated pool / unpool assembled from every rank's slices, in decode/ep's layout (the pooled
-width permuted as decode.ep.kernel.pooled_perm); fp8 experts then share one w2 column scale across
-slices, as a checkpoint's whole expert does. Its arm is decode.ep.config.ep_arm's
+--ep runs the EP megakernel (muse_megakernel/decode/spep): each rank gets its 32 whole experts and
+the replicated pool / unpool assembled from every rank's slices, in decode/spep's layout (the pooled
+width permuted as common.ep_layout.kperm); fp8 experts then share one w2 column scale across
+slices, as a checkpoint's whole expert does. Its arm is decode.spep.config.ep_arm's
 (SGLANG_TPU_MUSE_MK_EP_ARM=a2a | gather forces one; a2a needs >= 64 rows).
 """
 
@@ -347,7 +347,7 @@ def _permute_packed_rows(
 def _requant_kperm(
     words: torch.Tensor, scale: torch.Tensor, perm: torch.Tensor, block: int
 ) -> tuple:
-    """decode.ep.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
+    """decode.spep.experts.requant_fp4_kperm on natural int32 words [K/8, N]: (words in perm order,
     scales [K / block, N], the requantized weights as f32 in natural order)."""
     k, n, dev = words.shape[0] * 8, words.shape[1], words.device
     e2m1, perm = _E2M1[:8].to(dev), perm.to(dev)
@@ -442,7 +442,7 @@ def served_expert_refs(l: int, rank: int, device: torch.device) -> list:
 def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
     """decode_expert of one rank's slice; --qblock-ref: the requantized weights the kernel
     reads (SGLANG_TPU_MUSE_MK_QBLOCK blocks, in kperm order with --ep, else natural order)."""
-    from sglang_tpu.muse_megakernel.decode.ep.experts import kperm, qblock
+    from sglang_tpu.muse_megakernel.common.ep_layout import kperm, qblock
 
     slabs = [t.to(_REF_DEVICE) for t in expert_slabs(l, rank, e, kind)]
     if not (_QBLOCK_REF and kind == "fp4"):
@@ -463,11 +463,11 @@ def ref_expert(l: int, rank: int, e: int, kind: str) -> tuple:
 
 
 def ep_expert_slabs(l: int, rank: int, kind: str) -> list:
-    """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in decode/ep's layout:
+    """One rank's whole experts (w13, w13_scale, w2, w2_scale), stacked, in decode/spep's layout:
     every rank's intermediate slices of each expert side by side, the hidden rows in
-    pooled_perm order and, for fp4, the gate / up columns and w2's rows in kperm order; then
+    kperm order and, for fp4, the gate / up columns and w2's rows in kperm order; then
     w13's columns in chunk_cols order."""
-    from sglang_tpu.muse_megakernel.decode.ep.experts import chunk_cols, kperm, qblock
+    from sglang_tpu.muse_megakernel.common.ep_layout import chunk_cols, kperm, qblock
 
     el, il, he = N_EXPERTS // TP, INTER_LOCAL, EXPERT_HIDDEN
     cc = torch.from_numpy(chunk_cols(2 * TP * il, il))
@@ -641,9 +641,9 @@ class _Runner:
     weights of this rank; runs one compiled step per call."""
 
     def __init__(
-        self, K, ops, n_layers: int, global_layers: tuple, rank: int, max_position: int
+        self, ops, n_layers: int, global_layers: tuple, rank: int, max_position: int
     ):
-        self.K, self.ops, self.rank = K, ops, rank
+        self.ops, self.rank = ops, rank
         self.n_layers, self.global_layers = n_layers, global_layers
         self.kinds = _kinds(n_layers)
         self.overrides: dict = {}
@@ -690,14 +690,17 @@ class _Runner:
         ]
 
     def _weights(self, max_position: int) -> list:
-        K, L = self.K, self.n_layers
+        from sglang_tpu.muse_megakernel.common.consts import NEG, SMALL, SMALL_ROWS
+        from sglang_tpu.muse_megakernel.common.scratch import WEIGHT_NAMES
+
+        L = self.n_layers
         dense = [dense_layer(l, self.rank) for l in range(L)]
         if (
             _EP
         ):  # replicated pool / unpool: every rank's slices, the pooled width permuted
-            from sglang_tpu.muse_megakernel.decode.ep.kernel import pooled_perm
+            from sglang_tpu.muse_megakernel.common.ep_layout import kperm
 
-            kp = torch.from_numpy(pooled_perm(EXPERT_HIDDEN))
+            kp = torch.from_numpy(kperm(EXPERT_HIDDEN))
             for l in range(L):
                 ranks = [dense_layer(l, d) for d in range(TP)]
                 for name in ("wpool", "wunpool"):
@@ -706,11 +709,11 @@ class _Runner:
                     if name == "wpool":
                         w, sc = w[:, kp], sc[kp]
                     dense[l][name], dense[l][name + "_s"] = w, sc
-        smalls = torch.zeros(L, K.SMALL_ROWS, HIDDEN)
+        smalls = torch.zeros(L, SMALL_ROWS, HIDDEN)
         for l in range(L):
             rep = replicated_layer(l)
             if _EP:
-                rep["pre_expert_w"] = rep["pre_expert_w"][pooled_perm(EXPERT_HIDDEN)]
+                rep["pre_expert_w"] = rep["pre_expert_w"][kperm(EXPERT_HIDDEN)]
             for name in (
                 "pre_attn_w",
                 "attn_alpha",
@@ -720,14 +723,14 @@ class _Runner:
                 "ffn_alpha",
                 "ffn_beta",
             ):
-                smalls[l, K.SMALL[name]] = rep[name]
+                smalls[l, SMALL[name]] = rep[name]
             for name in ("pre_expert_w", "post_expert_w"):
-                smalls[l, K.SMALL[name], :EXPERT_HIDDEN] = rep[name]
-            smalls[l, K.SMALL["expert_bias"]] = K.NEG
-            smalls[l, K.SMALL["expert_bias"], :N_EXPERTS] = rep["expert_bias"]
+                smalls[l, SMALL[name], :EXPERT_HIDDEN] = rep[name]
+            smalls[l, SMALL["expert_bias"]] = NEG
+            smalls[l, SMALL["expert_bias"], :N_EXPERTS] = rep["expert_bias"]
             for name in _RANK_SCALE_ROWS:
                 s = dense[l][name]
-                smalls[l, K.SMALL[name], : s.numel()] = s
+                smalls[l, SMALL[name], : s.numel()] = s
         final = torch.zeros(8, HIDDEN)
         final[0] = final_gain()
         by_name = {
@@ -738,16 +741,18 @@ class _Runner:
         }
         for name in ("wqkvg", "wo", "wpool", "wunpool"):
             by_name[name] = torch.stack([d[name] for d in dense])
-        return [by_name[n].to(self.device) for n in K.WEIGHT_NAMES]
+        return [by_name[n].to(self.device) for n in WEIGHT_NAMES]
 
     def experts(self, expert_group: int) -> list:
+        from sglang_tpu.muse_megakernel.common.plan import expert_units
+
         groups = self.ops.expert_groups_of(self.kinds, expert_group)
         self.mk.expert_groups = groups
         if not groups:
             return [t for slabs in self.per_layer_experts for t in slabs]
         cfg = SimpleNamespace(n_layers=self.n_layers, expert_groups=groups)
         refs = []
-        for unit in self.K.expert_units(cfg):
+        for unit in expert_units(cfg):
             if unit[0] == "layer":
                 refs += self.per_layer_experts[unit[1]]
             else:
@@ -1400,7 +1405,6 @@ def main() -> None:
     # entry (TORCHINDUCTOR_CACHE_DIR, /tmp/torchinductor_* by default) replays without tracing
     torch.compiler.config.force_disable_caches = True
     from sglang_tpu.muse_megakernel import ops
-    from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 
     cases = [CASES[c] for c in args.cases]
     base = dict(_parse_flag(f) for f in args.base_cfg)
@@ -1415,7 +1419,7 @@ def main() -> None:
             os.makedirs(os.path.join(args.out_dir, c.name))
     max_position = max(step_inputs(c).max_position for c in cases)
     t0 = time.time()
-    runner = _Runner(K, ops, args.layers, global_layers, rank, max_position)
+    runner = _Runner(ops, args.layers, global_layers, rank, max_position)
     if rank == 0:
         print(f"MK_NUMERICS_SETUP weights {time.time() - t0:.1f}s", flush=True)
     dist.barrier()

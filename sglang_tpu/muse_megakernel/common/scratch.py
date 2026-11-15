@@ -83,28 +83,26 @@ def _can_w2_attn_scratch(c: MKConfig) -> bool:
         and c.attn_opt in (3, 4, 5)
         and c.kv_sal
         and c.kv_sal_fp8
-        and c.sal_fp8_dot >= 2
+        and (c.sal_fp8_dot >= 2)
         and c.attn_exp2
-        and not c.use_sal_preones
-        and c.kv_heads == 2
-        and c.head_dim == 64
-        and 2 * c.kv_heads * c.rows_per_req * c.g > LANE
-        and c.rows_per_req * c.g <= 64
-        and c.chunk_pages * c.page_size == 1024
+        and (c.kv_heads == 2)
+        and (c.head_dim == 64)
+        and (2 * c.kv_heads * c.rows_per_req * c.g > LANE)
+        and (c.rows_per_req * c.g <= 64)
+        and (c.chunk_pages * c.page_size == 1024)
         and (c.expert_depth + 1) * (c.inter_local // FP4_PACK) >= 192
-        and c.expert_hidden >= 4 * c.attn_streams * LANE
+        and (c.expert_hidden >= 4 * c.attn_streams * LANE)
     )
 
 
 def _use_attn_p_fp8(c: MKConfig) -> bool:
     return bool(
-        (c.attn_p_fp8 or (c.attn_head_fp8 >= 2 and _can_w2_attn_scratch(c)))
+        (c.attn_head_fp8 >= 2 and _can_w2_attn_scratch(c))
         and c.attn_pipe
         and c.attn_opt in (3, 4, 5)
         and c.kv_sal
         and c.kv_sal_fp8
-        and c.sal_fp8_dot >= 2
-        and not (c.use_sal_preones and c.kv_heads * c.rows_per_req * c.g > 64)
+        and (c.sal_fp8_dot >= 2)
     )
 
 
@@ -345,8 +343,6 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
     ]
     if not (c.vec_route and c.trim_sems):
         items += [("ids_sem", pltpu.SemaphoreType.DMA((1,)))]
-    if c.ex_gs_smem and (c.scale_fp8 or c.ex_kperm >= 3):
-        items += [("gs_s", smem((8, c.n_experts_padded), f32))]
     if not alias_oy:
         items += [("pad_o_rs", pmem((tp, R, Hl // 2), u32))]
         if not _alias_oag_into_f(c):
@@ -424,7 +420,7 @@ def _scratch_plan_tiled(c: MKConfig) -> list:
         ]
     if vy < 2:
         items += [
-            # vmem_trim: the ring lives in xfull (kernel Y_XFULL_ROW0)
+            # vmem_trim: the ring lives in xfull (Y_XFULL_ROW0)
             *(
                 []
                 if c.vmem_trim
@@ -454,15 +450,11 @@ def _scratch_plan_base(cfg: MKConfig):
     w13_words = He // FP4_PACK
     w2_words = Il // FP4_PACK
     cpt = c.chunk_pages * c.page_size
-    sdt = jnp.float8_e4m3fn if c.scale_fp8 else jnp.bfloat16
+    sdt = jnp.bfloat16
     # tile_loops QBLOCK slots hold the K / qblock scale rows the dots read
     slim = bool(c.qblock and c.tile_loops)
     s13_rows = max(He // c.qblock, 16) if slim else He // FP4_GROUP
-    s2_rows = (
-        max(Il // c.qblock, 16)
-        if slim
-        else max(Il // FP4_GROUP, 32 if c.scale_fp8 else 16)
-    )
+    s2_rows = max(Il // c.qblock, 16) if slim else max(Il // FP4_GROUP, 16)
     items = [
         (
             "ring",
@@ -626,23 +618,13 @@ def _scratch_plan_base(cfg: MKConfig):
             ("o_rsems", pltpu.SemaphoreType.DMA((c.tp,))),
             ("f_rsems", pltpu.SemaphoreType.DMA((c.tp,))),
         ]
-    if c.scale_fp8:
-        items += [
-            # the fp8 layers' bf16 channel scales, which the e4m3 slabs cannot hold
-            ("w13c", pltpu.VMEM((nslot, 2, 2 * Il), jnp.bfloat16)),
-            ("w2c", pltpu.VMEM((nslot, 2, He), jnp.bfloat16)),
-        ]
-    if c.scale_fp8 or c.ex_kperm >= 3:
-        items += [
-            # this layer's (gate, up, down) globals, one expert per lane
-            ("gs_v", pltpu.VMEM((8, c.n_experts_padded), jnp.float32)),
-        ]
-        if c.ex_gs_smem:
-            items += [("gs_s", pltpu.SMEM((8, c.n_experts_padded), jnp.float32))]
     return items
 
 
 # ----------------------------------------------------------------------------- the program
+# vmem_trim: the combine ring's first xfull row (u_send holds rows [0, rows per device <= 32))
+Y_XFULL_ROW0 = 32
+
 WEIGHT_NAMES = (
     "rope",
     "final_norm",

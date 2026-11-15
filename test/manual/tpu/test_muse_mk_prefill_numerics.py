@@ -55,6 +55,8 @@ class Case(msgspec.Struct, frozen=True):
     fp8_gather: bool = False
     # M.Case fields the reference reads
     kv: str = "sal_fp8"
+    # padded rows' multiple (16: decode-shaped SP steps, prefill_config's SP_ROW_ALIGN)
+    row_align: int = 128
 
 
 CASES = {
@@ -75,6 +77,14 @@ CASES = {
         Case("pf_c1q4096_ctx128k", 1, 4096, (131072,)),
     )
 }
+# decode-shaped steps (one new token per request, 4096 cached) for the SP + EP decode target
+# (--sp with SGLANG_TPU_MUSE_MK_SP_O_RS=1): R rows = R requests
+CASES.update(
+    {
+        f"dec_r{r}": Case(f"dec_r{r}", r, 1, (4096,) * r, row_align=16)
+        for r in (16, 32, 48, 64, 128)
+    }
+)
 # (case, flag): reruns that must be bit-identical to the case's run
 DEFAULT_EXACT = (("pf_c1q384", "repeat"), ("pf_c1q384", "expert_group=2"))
 
@@ -82,7 +92,7 @@ DEFAULT_EXACT = (("pf_c1q384", "repeat"), ("pf_c1q384", "expert_group=2"))
 def step_inputs(case: Case) -> M.StepInputs:
     ps = M._PAGES[case.kv]
     n_live = case.n_req * case.q
-    rows = -(-n_live // 128) * 128
+    rows = -(-n_live // case.row_align) * case.row_align
     pps = -(-(max(case.ctx) + case.q) // ps)
     # SWA ring of more than window + chunk tokens: the chunk's writes never land on a key
     # that one of its queries still reads
@@ -165,30 +175,33 @@ def _sp_expert_refs(l: int, rank: int, kind: str, device: torch.device) -> list:
     return [torch.stack(t).to(device) for t in out]
 
 
-def _sp_replicate_pool(runner, n_layers: int) -> None:
+def _sp_replicate_pool(runner, n_layers: int, pool: bool = True) -> None:
     """wpool / wunpool / wo replicated: every rank's slices side by side, their scales too."""
-    K = runner.K
-    names = list(K.WEIGHT_NAMES)
+    from sglang_tpu.muse_megakernel.common.consts import SMALL
+    from sglang_tpu.muse_megakernel.common.scratch import WEIGHT_NAMES
+
+    names = list(WEIGHT_NAMES)
     sm = runner.weights[names.index("smalls")].cpu()
-    for name in ("wpool", "wunpool"):
+    for name in ("wpool", "wunpool") if pool else ():
         full = []
         for l in range(n_layers):
             ranks = [M.dense_layer(l, d) for d in range(TP)]
             full.append(torch.cat([r[name] for r in ranks], dim=1))
             sc = torch.cat([r[name + "_s"] for r in ranks])
-            sm[l, K.SMALL[name + "_s"]] = 0
-            sm[l, K.SMALL[name + "_s"], : sc.numel()] = sc
+            sm[l, SMALL[name + "_s"]] = 0
+            sm[l, SMALL[name + "_s"], : sc.numel()] = sc
         runner.weights[names.index(name)] = torch.stack(full).to(runner.device)
     # wo whole (the SP o-proj runs locally on every head): every rank's rows stacked, requantized
-    # to one per-output-channel scale (each rank's slice had its own)
+    # to one per-output-channel scale (each rank's slice had its own). The decode target
+    # (SGLANG_TPU_MUSE_MK_SP_O_RS) reads its row block of the same tensor.
     full = []
     for l in range(n_layers):
         ranks = [M.dense_layer(l, d) for d in range(TP)]
         w = torch.cat([r["wo"].float() * r["wo_s"][None] for r in ranks])
         sc = w.abs().amax(0).clamp_min(1e-30) / 448.0
         full.append((w / sc).to(torch.float8_e4m3fn))
-        sm[l, K.SMALL["wo_s"]] = 0
-        sm[l, K.SMALL["wo_s"], : sc.numel()] = sc
+        sm[l, SMALL["wo_s"]] = 0
+        sm[l, SMALL["wo_s"], : sc.numel()] = sc
     runner.weights[names.index("wo")] = torch.stack(full).to(runner.device)
     runner.weights[names.index("smalls")] = sm.to(runner.device)
 
@@ -228,9 +241,10 @@ class _DeviceRef:
     EXPERT_CHUNK = 32  # experts dequantized per batched matmul
 
     def __init__(self, base, n_layers: int):
-        K = base.K
-        self.base, self.K, self.dev, self.rank = base, K, base.device, base.rank
-        self.w = dict(zip(K.WEIGHT_NAMES, base.weights))
+        from sglang_tpu.muse_megakernel.common.scratch import WEIGHT_NAMES
+
+        self.base, self.dev, self.rank = base, base.device, base.rank
+        self.w = dict(zip(WEIGHT_NAMES, base.weights))
         # this rank's slice of every expert, natural order (block-256 fp4 under QBLOCK)
         self.experts = [
             [
@@ -243,7 +257,9 @@ class _DeviceRef:
         ]
 
     def _row(self, l: int, name: str, n: int | None = None):
-        r = self.w["smalls"][l][self.K.SMALL[name]]
+        from sglang_tpu.muse_megakernel.common.consts import SMALL
+
+        r = self.w["smalls"][l][SMALL[name]]
         return r if n is None else r[:n]
 
     def _mv(self, x, l: int, name: str, n: int | None = None):
@@ -448,16 +464,20 @@ class _PrefillRunner:
         capture: tuple | None = None,
     ):
         from sglang_tpu.muse_megakernel import ops
-        from sglang_tpu.muse_megakernel.decode.tp import kernel as K
 
         self.ops = ops
-        self.base = M._Runner(K, ops, n_layers, global_layers, rank, max_position)
+        self.base = M._Runner(ops, n_layers, global_layers, rank, max_position)
         self.sp = sp
         # aux layers the step returns (numerics checks every layer; all by default)
         self.capture = list(range(n_layers)) if capture is None else list(capture)
         # built before SP replaces the pool / unpool weights: it reads every rank's slices
         self.ref = _DeviceRef(self.base, n_layers) if with_ref else None
+        # --sp-ep-layout: the base runner already holds decode EP's layout (M._EP: whole
+        # experts, replicated pool / unpool in kperm order); only wo is replicated here
+        ep_layout = sp and M._EP
         for l, kind in enumerate(self.base.kinds):
+            if ep_layout:
+                continue
             if sp:
                 self.base.per_layer_experts[l] = _sp_expert_refs(
                     l, rank, kind, self.base.device
@@ -467,7 +487,7 @@ class _PrefillRunner:
                     l, rank, self.base.device
                 )
         if sp:
-            _sp_replicate_pool(self.base, n_layers)
+            _sp_replicate_pool(self.base, n_layers, pool=not ep_layout)
         mk = self.base.mk
         mk.moe_mode = "ep" if sp else "tp"
         mk.w4a16_layers = ops.w4a16_layers_of(self.base.kinds, M.tp_qblock())
@@ -496,7 +516,8 @@ class _PrefillRunner:
         meta = torch.tensor([st.n_live, self.base.rank], dtype=torch.int32)
         kv_lens = torch.tensor([c + case.q for c in case.ctx], dtype=torch.int32)
         cu_q = torch.arange(n + 1, dtype=torch.int32) * case.q
-        dist_ = torch.tensor([n, n, n], dtype=torch.int32)
+        # RPA's [mixed, prefill, total] cumsum: decode-shaped steps (q = 1) are decode-only
+        dist_ = torch.tensor([0, 0, n] if case.q == 1 else [n, n, n], dtype=torch.int32)
         capture = self.capture
         op = torch.ops.sglang_tpu_pallas.muse_prefill
 
@@ -692,6 +713,9 @@ def main() -> None:
     ap.add_argument("--profile-dir", default="")
     # with --bench-iters: aux layers to return, comma-separated (empty: none); default all
     ap.add_argument("--capture", default=None)
+    # SP on decode EP's weight layout (SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT): the layout prefill SP
+    # and both decode paths share; timing only for now (the reference reads TP slices)
+    ap.add_argument("--sp-ep-layout", action="store_true")
     # debug: build the runner (weights, pools) and exit before any prefill step
     ap.add_argument("--setup-only", action="store_true")
     args = ap.parse_args()
@@ -699,6 +723,11 @@ def main() -> None:
         raise ValueError("--capture is for --bench-iters; numerics checks every layer")
     if args.sp:
         os.environ["SGLANG_TPU_MUSE_MK_PREFILL_SP"] = "1"
+    if args.sp_ep_layout:
+        if not (args.sp and args.bench_iters):
+            raise ValueError("--sp-ep-layout needs --sp and --bench-iters")
+        os.environ["SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT"] = "1"
+        M._EP = True
     if M.tp_qblock() != 256:
         raise ValueError(
             "needs SGLANG_TPU_MUSE_MK_QBLOCK=256 (served block-256 experts)"

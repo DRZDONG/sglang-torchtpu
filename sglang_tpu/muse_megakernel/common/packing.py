@@ -8,27 +8,6 @@ from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE
 
 
-def _pack_xfull_256(x):
-    """Pack f32 ``[M, He]`` into u32 ``[M, He // 2]`` in 256-col (128-word) blocks."""
-    nb = x.shape[-1] // (2 * LANE)
-    lo = jnp.concatenate(
-        [x[..., b * 2 * LANE : (2 * b + 1) * LANE] for b in range(nb)], axis=-1
-    )
-    hi = jnp.concatenate(
-        [x[..., (2 * b + 1) * LANE : (2 * b + 2) * LANE] for b in range(nb)],
-        axis=-1,
-    )
-    return _bf16_bits(lo) | (_bf16_bits(hi) << 16)
-
-
-def _unpack_xfull_256_chunk(w, out_fp8: bool = False):
-    """Unpack ``n_w`` (multiple of LANE) u32 cols packed by ``_pack_xfull_256``."""
-    nb = w.shape[-1] // LANE
-    parts = [_unpack_bf16x2(w[..., b * LANE : (b + 1) * LANE]) for b in range(nb)]
-    res = parts[0] if nb == 1 else jnp.concatenate(parts, axis=-1)
-    return res.astype(jnp.float8_e4m3fn) if out_fp8 else res.astype(jnp.bfloat16)
-
-
 def _bf16_bits(x):
     """f32 -> its round-to-nearest-even bf16 bit pattern in the low 16 bits of a u32."""
     b = jax.lax.bitcast_convert_type(x, jnp.uint32)

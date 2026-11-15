@@ -8,9 +8,9 @@ python sglang_tpu/muse_megakernel/doc/gen_diagrams.py
 
 ![Comparison of the three programs](comm_overview.svg)
 
-Single-column views: [(1) Prefill TP](comm_prefill_tp.svg) · [(2) Prefill SP](comm_prefill_sp.svg) · [(3) Prefill SP target](comm_prefill_sp_target.svg) · [(4) Decode TP](comm_decode_tp.svg) · [(5) Decode EP](comm_decode_ep_gather.svg) · [(6) EP target](comm_decode_ep_gather_target.svg) · [(7) Decode SP + EP](comm_decode_ep_a2a.svg) · [(8) SP + EP target](comm_decode_ep_a2a_target.svg)
+Single-column views: [(1) Prefill TP](comm_prefill_tp.svg) · [(2) Prefill SP](comm_prefill_sp.svg) · [(3) Prefill SP target](comm_prefill_sp_target.svg) · [(4) Decode TP](comm_decode_tp.svg) · [(5) Decode EP](comm_decode_ep_gather.svg) · [(6) EP target](comm_decode_ep_gather_target.svg) · [(7) Decode SP + EP](comm_decode_ep_a2a.svg) · [(8) SP + EP target](comm_decode_ep_a2a_target.svg) · [(9) SP + EP target, sliced pool / unpool](comm_decode_ep_a2a_sliced.svg)
 
-Columns (1), (2), (4), (5) and (7) show the code as it is ((2) is uncommitted wave 1; (5) and (7) exist but are not wired for serving). (6) and (8) sit next to (5) and (7) and show them under the dtype policy below; (3) is (2) with the o RS replaced by a row all-to-all (approved, not implemented).
+Columns (1), (2), (4), (5) and (7) show the code as it is ((2) is uncommitted wave 1; (5) and (7) exist but are not wired for serving). (6) and (8) sit next to (5) and (7) and show them under the dtype policy below; (3) is (2) with the o RS replaced by a row all-to-all (approved, not implemented). (9) is (8) with pool / unpool on column slices of the replicated weights; the slicing exists in the prefill SP program (`SGLANG_TPU_MUSE_MK_SP_COL_POOL`, `col_dense` in [prefill/spep/program.py](../prefill/spep/program.py)), the decode a2a with per-destination segments does not yet.
 
 ## Notation
 
@@ -45,7 +45,7 @@ The diagrams color every dtype: <span style="color:#d1242f">**f32**</span>, <spa
 | Router | wrouter bf16 replicated; every rank routes all R rows (redundant) | wrouter bf16 replicated; each rank routes only its own R/8 rows | Same as (1) |
 | pooler / unpooler | Column-parallel, then AG | Weights replicated; local matmul on own rows, no collective | Column-parallel, then AG |
 | Experts | expert-TP: each rank holds 1/8 of I for every expert | EP: 32 whole experts per rank (`gmm_v2`) | Same as (1); computes only the selected experts |
-| Comm mechanism | `GridColl`: 2 cross-chip hops plus the on-die partner, pipelined over 64/128-row tiles | XLA `all_gather` / `psum_scatter`; the MoE a2a is an in-kernel remote-DMA all-to-all (prefill/sp/a2a.py) | `Coll` direct: issues 7 remote DMAs at once straight into peer VMEM |
+| Comm mechanism | `GridColl`: 2 cross-chip hops plus the on-die partner, pipelined over 64/128-row tiles | XLA `all_gather` / `psum_scatter`; the MoE a2a is an in-kernel remote-DMA all-to-all (common/a2a.py) | `Coll` direct: issues 7 remote DMAs at once straight into peer VMEM |
 | Kernels per layer | 4 (RPA, attn_out, fused-RS MoE, post_moe) | XLA graph + RPA + `gmm_v2` | One pallas_call for all 62 layers |
 | Collectives | 7 | 5 (plus 2 AG after the last layer) | 6 (5 when B <= 2) |
 | KiB/row | 112 | 34.4 | 112 (R <= 32) / 87.5 (R=64, row-tiled) |
@@ -81,10 +81,10 @@ Dtypes shared by all programs:
 | 1 | a_in AG | [R/8, H] -> [R, H] | fp8 e4m3 + f32 row scale | 7 | 28 |
 | 2 | o RS (psum_scatter) | [R, H] -> [R/8, H] | bf16 (feeds the post-attention norm) | 14 | 56 |
 | 3 | count exchange (AG) | per-global-expert counts [256] -> [8, 256] | int32 | 7 KiB per layer | ~0 |
-| 4 | dispatch a2a, remote DMA ([prefill/sp/a2a.py](../prefill/sp/a2a.py)) | (row, slot) pairs sorted by global expert -> receive buffer in local-expert, then source order | 1152 u32 per row (`pack_rows`): byte b of word c holds e4m3 element b*He/4 + c, word He/4 the f32 row scale, then lane padding (12.5% over the payload) | 4.91 | 19.6 |
+| 4 | dispatch a2a, remote DMA ([common/a2a.py](../common/a2a.py)) | (row, slot) pairs sorted by global expert -> receive buffer in local-expert, then source order | 1152 u32 per row (`pack_rows`): byte b of word c holds e4m3 element b*He/4 + c, word He/4 the f32 row scale, then lane padding (12.5% over the payload) | 4.91 | 19.6 |
 | 5 | combine a2a, remote DMA | the same segments back into each source's sorted order | bf16 (feeds the post-expert norm) | 8.53 | 34.1 |
 
-- Uncommitted wave 1 of the rewrite to EP + ragged a2a ([prefill/sp/program.py](../prefill/sp/program.py)): the dtype policy applied. e4m3 activations with a row scale go into every dense dot (fp8 x fp8), the AG and the dispatch, and q goes to attention as e4m3 at unit scale (no `q_scale`: RPA's q rescale clips in the q dtype; batched RPA writes its bf16 output to a separate buffer, `RpaServeConfigs.separate_out`); experts run W4A8 / W8A8 (`gmm_v2` requantizes x and h, and fuses silu(gate) * up into the w13 epilogue); bf16 only on the o RS, the expert outputs and the unpool output, which all feed a norm. The router input stays bf16 until a GSM8K A/B.
+- Uncommitted wave 1 of the rewrite to EP + ragged a2a ([prefill/spep/program.py](../prefill/spep/program.py)): the dtype policy applied. e4m3 activations with a row scale go into every dense dot (fp8 x fp8), the AG and the dispatch, and q goes to attention as e4m3 at unit scale (no `q_scale`: RPA's q rescale clips in the q dtype; batched RPA writes its bf16 output to a separate buffer, `RpaServeConfigs.separate_out`); experts run W4A8 / W8A8 (`gmm_v2` requantizes x and h, and fuses silu(gate) * up into the w13 epilogue); bf16 only on the o RS, the expert outputs and the unpool output, which all feed a norm. The router input stays bf16 until a GSM8K A/B.
 - pooler / unpooler weights are replicated, so router, pooler, combine and unpooler run on the rank's own R/8 rows with no collective. Attention is not sequence-parallel: it still gathers all R rows (#1, #2).
 - The a2a moves (source, global expert) segments in 8-row chunks: Mosaic DMAs only at HBM-tile-aligned row offsets, 8 rows for u32 / bf16 / f32 and 32 for e4m3, which is why dispatch rows are packed as u32. The receiver's buffer is already grouped by expert, so the expert FFN reads it with no reorder. Rounding each segment up to whole chunks costs 1.22x at R=4096 (simulated; 32-row chunks cost 2.0x and measured 13% slower): 4.91 KiB/row dispatch, 8.53 combine. A token still sends one copy per slot.
 - The receive buffer is still allocated for the worst case (cap = R*8 + 1792 rows, rounded to 256-row unpack blocks), but a Pallas `unpack_rows` decodes only the rows that arrived, so its size no longer shows up in HBM traffic.
@@ -123,7 +123,7 @@ The table is the base program (R <= 32, everything in VMEM). R > 32 runs the row
 
 ## (5)-(8) Decode EP vs SP + EP
 
-If prefill runs SP + EP, decode has to read the same weights: experts become 32 whole experts per rank, and pooler / unpooler are stored replicated. [decode/ep/](../decode/ep/) implements two paradigms on the row-tiled megakernel (an `EPHook`), picked by one explicit switch, `SGLANG_TPU_MUSE_MK_EP_ARM`:
+If prefill runs SP + EP, decode has to read the same weights: experts become 32 whole experts per rank, and pooler / unpooler are stored replicated. [decode/spep/](../decode/spep/) implements two paradigms on the row-tiled megakernel (an `EPHook`), picked by one explicit switch, `SGLANG_TPU_MUSE_MK_EP_ARM`:
 
 - `gather` (default): **EP**, every row on every rank. Columns (5), and (6) with target dtypes.
 - `a2a`: **SP + EP**, each rank owns R/8 rows, the MoE behind ragged all-to-alls. Columns (7), and (8) with target dtypes.
@@ -147,6 +147,29 @@ There is no row-count threshold: both run at any R (a multiple of 16; EP forces 
 - Target dtypes ((6), (8)) cut ICI bytes and run the dots at fp8 MXU rate, but do not change HBM DMA: decode HBM traffic is weights (already fp8 / fp4) plus KV, and the activations live in VMEM. What they do change is the KV pool: fp8 is required, against bf16 or fp8 today (244 vs 488 MiB per 1M attended tokens).
 - Which paradigm wins at a given R is not settled: profile both with the bench script below.
 
+## (9) Decode SP + EP target, pool / unpool column-sliced
+
+Goal: EP decode only has to match TP, with the weight layout SP prefill reads on one host. (9) is (8) with one change: pool / unpool run on this rank's 1/8 output-column slice of the replicated wpool / wunpool, over all R rows, as (5) does, instead of in full on own rows. Each rank reads 4 + 4 instead of 32 + 32 MiB, so the fixed weight reads go back to TP's 38 MiB per layer (26 / 8 / 4), down from 94 in (8). The rest is (8): e4m3 a_in AG before attention, o_proj on this rank's row block of the replicated wo (the same tensor SP prefill reads), then a bf16 RS by row; MoE dispatch as a remote-DMA a2a of u32-packed e4m3 rows, y returned in bf16.
+
+| # | (4) Decode TP, R=64 row-tiled | KiB/row | (9) | KiB/row @R=64 |
+|---|---|---|---|---|
+| 1 | o RS (column-streamed), bf16 | 14 | a_in AG, e4m3 + row scale | 7 |
+| 2 | o AG, bf16 | 14 | o RS by row, bf16 (feeds post-attn norm) | 14 |
+| 3 | pool AG, bf16 | 7 | ffn AG, e4m3 + row scale (the pooler needs every row) | 7 |
+| 4 | y RS, int8 + f32 scales | 31.5 | pool a2a by row to the owner, bf16 (feeds pre-expert norm) | 0.875 |
+| 5 | u AG, bf16 | 7 | count exchange, 7 KiB per layer | 0.11 |
+| 6 | f AG, bf16 | 14 | dispatch a2a, 1152 u32 per (row, slot), per-(source, destination) 8-row segments, 1.41x | 5.55 |
+| 7 | | | y return, bf16 | 7 |
+| 8 | | | u AG, e4m3 + row scale | 3.5 |
+| 9 | | | f a2a by row to the owner, bf16 (feeds post-FFN norm) | 1.75 |
+| | **Total** | **87.5** | **Total** | **46.8** |
+
+- A column slice produces whole output columns, not partial sums. So the pool output and the unpool output each go to the row owner by an a2a (#4, #9) rather than an RS. A K-split unpool (row slice of wunpool, partial [R, H] output, bf16 RS by row) also reads 4 MiB but costs 14 + 0.44 KiB/row instead of 3.5 + 1.75.
+- Comm is 46.8 KiB/row, 53% of TP. That is not under half: the ffn AG (7) and the u AG (3.5) that slicing adds cost more than (8)'s 33 KiB/row saves. The attention pair (a_in AG + o RS, 21 KiB/row) is the largest item, the same as in (2).
+- The dispatch has to keep per-(source, destination) segments, as common/a2a.py does today. Prefill's per-(source, expert) SEG=8 segments pad 7.17x at R=64 (simulated, ~57 hit experts across 64 pairs per source): 28 KiB/row dispatch and 50 combine, which would put (9) above TP.
+- Measured decode runs of (8) / (9) reuse the prefill SP program as-is, so their MoE a2a still has per-(source, expert) SEG=8 segments and 16-row expert groups (~7x dispatch padding). They are labeled "via the prefill SP program, per-expert segments" until the decode a2a moves to per-destination segments.
+- HBM: 38 MiB + E(R) + 76 KiB x R = ~782 MiB at R=64. Without expert imbalance (E = 678 instead of 739) that is ~721 MiB, TP's ~730. The slope adds an ffn AG pad [R, H] e4m3 in HBM (16 KiB x R) to (8)'s.
+
 Profile: `test/manual/tpu/bench_muse_ep_arms.py` runs both arms on the same weights and step inputs per R and reports step time, optionally with an xprof trace per (R, arm).
 
 ## HBM DMA (per layer, per rank)
@@ -166,11 +189,12 @@ Modeled as **fixed + E(R) + slope x R**: dense weights are fixed; activations an
 | (6) EP target | 38 (26 / 8 / 4) | E(R), ep | 128 (64 / 0 / 0 / 64) | ~785 MiB @R=64 |
 | (7) Decode SP + EP | 94 (26 / 36 / 32) | E(R), ep | 88 (40 / 0 / 40 / 8) | ~838 MiB @R=64 |
 | (8) SP + EP target | 94 (26 / 36 / 32) | E(R), ep | 60 (24 / 0 / 28 / 8) | ~837 MiB @R=64 |
+| (9) SP + EP target, sliced pool / unpool | 38 (26 / 8 / 4) | E(R), ep | 76 (24 / 16 / 28 / 8): ffn AG pad in HBM | ~782 MiB @R=64 (~721 without imbalance) |
 
 KV is listed separately because it scales with context, not R: **244 MiB per 1M attended tokens** per layer per rank (2 KV heads x 64 x K,V x 1 B = 256 B per token; a bf16 pool doubles it). New K/V writes are 256 B per new token (1 MiB per 4096-row chunk). Sliding layers cap the attended tokens at the 2048 window per request.
 
 - **(2)'s MoE no longer pays for its worst-case receive buffer.** Wave 0 materialized every receive-side tensor at cap = R*8 rows (~1,125 KiB x R); the remote-DMA a2a removed the zero-fill, sorts and scatter (~200), and `unpack_rows` now decodes only received rows: ~110 KiB x R.
-- **Replicated pooler / unpooler cost weights, not comm.** Wherever pool / unpool run on own rows ((2), (3), (7), (8)) the fixed part is 94 instead of 38 MiB, and each rank holds 56 MiB x 62 layers = 3.4 GiB more HBM. (3) also replicates wo: another 56 MiB per layer, 3.4 GiB.
+- **Replicated pooler / unpooler cost weights, not comm.** Wherever pool / unpool run on own rows ((2), (3), (7), (8)) the fixed part is 94 instead of 38 MiB; (9) reads only column slices and is back at 38, and each rank holds 56 MiB x 62 layers = 3.4 GiB more HBM. (3) also replicates wo: another 56 MiB per layer, 3.4 GiB.
 - **(1) moves the f32 residual [R, H] in and out twice per layer** (attn_out, post_moe): 128 KiB x R, 512 MiB at R=4096. SP keeps only R/8 rows of it.
 - **(4) decode is weight-bandwidth bound:** HBM traffic is 38 MiB + E(R) + 224 KiB x R (the row-tiled program keeps the residual and AG pads in HBM; at R <= 32 the base program keeps them in VMEM and the slope is 0.25); E(64) = 678 MiB.
 
@@ -183,7 +207,7 @@ KV is listed separately because it scales with context, not R: **244 MiB per 1M 
   | 128 | 252 | 767 MiB | 781 MiB | 1.02x |
   | 512 | 256 | 781 MiB | 781 MiB | 1.00x |
 
-- **At R=64:** (4) TP moves 5.5 MiB of comm and ~730 MiB of HBM per layer; (5) EP 4.4 MiB and ~785 MiB; (7) SP + EP 2.8 MiB and ~838 MiB. Each step down in comm costs more weight DMA (EP imbalance x1.09, then full replicated pool / unpool reads): (7) beats (4) only if ICI is more than ~40x slower per byte than HBM, less whatever comm the megakernel hides under weight streaming. Measure it.
+- **At R=64:** (4) TP moves 5.5 MiB of comm and ~730 MiB of HBM per layer; (5) EP 4.4 MiB and ~785 MiB; (7) SP + EP 2.8 MiB and ~838 MiB; (9) 2.9 MiB and ~782 MiB. Each step down in comm costs more weight DMA (EP imbalance x1.09, then full replicated pool / unpool reads): (7) beats (4) only if ICI is more than ~40x slower per byte than HBM, less whatever comm the megakernel hides under weight streaming. Measured (see Measured): (8), run through the prefill SP program, already beats (4) at R >= 64, so the HBM-only model is too pessimistic about SP + EP.
 - **The weight layout forces EP in decode, not SP.** Whole experts per rank and replicated pool / unpool follow from sharing prefill's weights. Row sharding does not: the gather arm keeps rows replicated and reads only column slices of the replicated pool / unpool.
 
 ## Dtype policy (target)
@@ -196,9 +220,9 @@ Default is fp8 e4m3; high precision only where a norm is computed. The diagrams 
 | RMS math (input / head q,k,o / post-attn / pre-FFN / pre-expert / post-expert / post-FFN) | f32 | f32 | The norm itself |
 | a_in after input_layernorm, and the SP a_in AG | bf16 | **fp8** + scale | AG 14 -> ~7 KiB/row; reuse coll.py `to_fp8` / `gathered` |
 | qkvg / o_proj / pooler / unpooler matmuls | bf16 x fp8 (mixed, bf16 MXU rate) | **fp8 x fp8**, f32 acc | Weights are already fp8 e4m3 |
-| q | bf16 | **fp8** | Prefill SP: done in wave 1 (unit-scale e4m3 q, RPA `separate_out`). Prefill TP: not yet. Decode: `attn_q_fp8` exists but is not wired |
+| q | bf16 | **fp8** | Prefill SP: done in wave 1 (unit-scale e4m3 q, RPA `separate_out`). Prefill TP: not yet. Decode: not yet |
 | K / V pool | fp8 | fp8 | Done |
-| P (softmax output) | bf16 | **fp8** | Decode `attn_p_fp8` exists but is not wired |
+| P (softmax output) | bf16 | **fp8** | Decode: not yet |
 | Gated attention output into o_proj | bf16 | **fp8** | |
 | o RS partials | bf16 (TP: f32 sum per hop) | bf16 | The sum feeds the post-attention norm. Prefill SP target (3) removes the RS: e4m3 row a2a, then o_proj with f32 acc |
 | xe after pre-expert norm, and the dispatch a2a | bf16 | **fp8** + scale | Dispatch 7 -> ~3.5 KiB/row |
@@ -223,6 +247,19 @@ Wave 1 applies this policy to (2): its comm went from 42 to 31.6 KiB/row, then 3
 
 A 5-layer slice, not the 62-layer model and not end to end; R = 4096, no prefix context.
 
+Decode, ms per layer (kernel-73 session, single host 2x2x1, 6 layers (global 1, 5), ctx 4096 per request, one new token per request so R rows = R requests, QBLOCK=256, 100 timed steps). (5) and (7) are the current EP arms on EP weights. (8) and (9) run **via the prefill SP program, per-expert segments**: the multi-kernel XLA SP program with RPA in its decode case, the MoE a2a still on per-(source, expert) SEG=8 segments, not the megakernel. The SP program picks expert gmm tile_m 64 at rows <= 1024 and one MoE chunk at rows <= 16 (sweep: R=16 0.48 ms with 1 chunk vs 0.72 with 4; R=32 / 64 favour 4).
+
+| R | (4) TP (megakernel) | (5) EP gather | (7) EP a2a | (8) SP + EP, o RS by row | (9) = (8) + column-sliced pool / unpool |
+|---|---|---|---|---|---|
+| 16 | 0.261 | 0.321 | 0.355 | 0.463 | 0.601 |
+| 32 | 0.432 | 0.476 | 0.514 | 0.586 | 0.642 |
+| 64 | 0.706 | 0.743 | 0.770 | 0.641 | 0.783 |
+| 128 | 1.085 | 1.130 | 1.163 | 0.786 | 0.843 |
+
+- (8) beats TP from R=64 (-9% at 64, -28% at 128), even as a multi-kernel XLA program with ~7x dispatch padding. At small R the fixed per-layer cost of its separate kernels and collectives dominates; there the in-megakernel a2a arm (7) is faster, so the target is (8)'s per-segment DMA and streamed chunks inside the megakernel EP hook.
+- (9) is slower than (8) here: each extra AG / a2a pair pays a kernel launch and sync in the XLA program, which costs more than the 56 MiB/layer of weight reads it saves. That may change once it is fused into the megakernel.
+- (5) vs (4) at R=64: the profile puts the EP gap at a 43 us RS wait (expert imbalance) plus about 30 us of unfolded AG waits and o_proj.
+
 ## Observations
 
 - **(2) moves about 3.3x less comm than (1)** (34.4 vs 112 KiB/row). Its MoE costs 13.4 KiB/row (fp8 dispatch + bf16 combine) against 63 KiB/row for expert-TP in (1) (routing psum + y RS + y AG); replicated pooler / unpooler also drop the xe and u AG (21 KiB/row).
@@ -232,7 +269,7 @@ A 5-layer slice, not the 62-layer model and not end to end; R = 4096, no prefix 
 
 ## EP decode (not wired)
 
-[decode/ep/](../decode/ep/) uses an `EPHook` to replace the o_proj collectives and the FFN section of the row-tiled megakernel. It has two arms:
+[decode/spep/](../decode/spep/) uses an `EPHook` to replace the o_proj collectives and the FFN section of the row-tiled megakernel. It has two arms:
 
 - **a2a arm** (R >= 128): o RS by rows, ragged A2A dispatch, y written back row by row, then an AG of the next layer's input.
 - **gather arm**: the u partial goes over the wire as **f32** in its RS.
@@ -245,7 +282,7 @@ Both arms need replicated wpool / wunpool and 32 whole experts per rank. Serving
 |---|---|
 | Program selection, weight packing | [ops.py](../ops.py) |
 | Prefill TP | [prefill/tp/program.py](../prefill/tp/program.py), [attn_out.py](../prefill/tp/attn_out.py), [post_moe.py](../prefill/tp/post_moe.py) |
-| Prefill SP + EP | [prefill/sp/program.py](../prefill/sp/program.py), [prefill/sp/a2a.py](../prefill/sp/a2a.py) (remote-DMA MoE a2a), [moe/pallas/gmm_v2.py](../../moe/pallas/gmm_v2.py) |
+| Prefill SP + EP | [prefill/spep/program.py](../prefill/spep/program.py), [common/a2a.py](../common/a2a.py) (remote-DMA MoE a2a), [moe/pallas/gmm_v2.py](../../moe/pallas/gmm_v2.py) |
 | Decode | [decode/tp/kernel.py](../decode/tp/kernel.py), [common/stream.py](../common/stream.py), [common/plan.py](../common/plan.py) |
 | Comm primitives | [common/coll.py](../common/coll.py) (`Coll` for decode, `GridColl` for prefill TP), [common/packing.py](../common/packing.py) |
 | fused-RS MoE | [moe/pallas/fused_rs/](../../moe/pallas/fused_rs/) |

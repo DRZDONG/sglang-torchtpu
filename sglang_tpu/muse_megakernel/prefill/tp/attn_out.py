@@ -20,13 +20,13 @@ from sglang_tpu.muse_megakernel.common.coll import (
     to_fp8,
     wait_all,
 )
+from sglang_tpu.muse_megakernel.common.config import PFConfig
 from sglang_tpu.muse_megakernel.common.consts import (
     LANE,
     PREFILL_ATTN_OUT_COLLECTIVE_ID,
     SMALL,
 )
 from sglang_tpu.muse_megakernel.common.numerics import _heads_rms, _rms, _topk_iter
-from sglang_tpu.muse_megakernel.prefill.tp.config import PFConfig
 
 # One idle iteration after every stage: each stage's remote DMAs get two iterations to land.
 _GAP = 1

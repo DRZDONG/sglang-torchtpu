@@ -22,6 +22,15 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.attention.pallas.batched_rpa import configs, schedule
 
 
+def _start_if(sz, src, dst, sem) -> None:
+    """Start the src -> dst DMA only when sz > 0. Unused schedule entries carry a stale
+    offset / page: a zero-length DMA from one is still an out-of-bounds descriptor."""
+
+    @pl.when(sz > 0)
+    def _():
+        pltpu.make_async_copy(src, dst, sem).start()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class _BypassRef(pltpu.BufferedRef):
@@ -93,15 +102,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
 
                 # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                # unused entries carry a stale page / offset: a zero-length DMA from one is
-                # still an out-of-bounds descriptor (the device faults at teardown)
-                @pl.when(sz > 0)
-                def _():
-                    pltpu.make_async_copy(
-                        kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                        vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
-                        sem,
-                    ).start()
+                _start_if(
+                    sz,
+                    kv_cache_hbm.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_off, sz)],
+                    sem,
+                )
 
             for i in range(self.cfgs.bkv_p_new):
                 dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
@@ -115,13 +121,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
 
                 # new_kv_hbm: (num_kv_heads * 2, kv_head_dim // packing, packing, total_new_tokens)
                 # vmem_dst_lane: (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
-                @pl.when(sz > 0)
-                def _():
-                    pltpu.make_async_copy(
-                        new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
-                        vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
-                        sem,
-                    ).start()
+                _start_if(
+                    sz,
+                    new_kv_hbm.at[:, :, :, pl.ds(src_new_off, sz)],
+                    vmem_dst_lane.at[b, :, :, :, pl.ds(dst_vmem_off, sz)],
+                    sem,
+                )
 
     def copy_out(
         self,
@@ -146,13 +151,12 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                 src_vmem_off = pl.multiple_of(src_vmem_off, 128)
                 sz = pl.multiple_of(sz, 128)
 
-                @pl.when(sz > 0)
-                def _():
-                    pltpu.make_async_copy(
-                        vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
-                        kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
-                        sem,
-                    ).start()
+                _start_if(
+                    sz,
+                    vmem_src_lane.at[b, :, :, :, pl.ds(src_vmem_off, sz)],
+                    kv_out_ref.at[hbm_p_idx, :, :, :, pl.ds(0, sz)],
+                    sem,
+                )
 
     def wait_in(
         self,
@@ -269,19 +273,21 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
 
         for i in range(len(dma_list_cache)):
             src_off, dst_off, sz, b = dma_list_cache[i]
-            pltpu.make_async_copy(
+            _start_if(
+                sz,
                 kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
-            ).start()
+            )
 
         for i in range(len(dma_list_new)):
             src_off, dst_off, sz, b = dma_list_new[i]
-            pltpu.make_async_copy(
+            _start_if(
+                sz,
                 new_kv_hbm.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
-            ).start()
+            )
 
     def copy_out(
         self,
@@ -309,11 +315,12 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                     page_indices_ref[global_p_idx] << self.cfgs.serve.page_size_log2
                 ) | p_off
                 sz = jnp.where(do_writeback, new_sz, 0)
-                pltpu.make_async_copy(
+                _start_if(
+                    sz,
                     vmem_src.at[b, pl.ds(src_vmem_off, sz)],
                     kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
                     sem,
-                ).start()
+                )
 
     def wait_in(
         self,
@@ -414,11 +421,12 @@ class BatchingORef(pltpu.BufferedRef):
 
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            pltpu.make_async_copy(
+            _start_if(
+                q_sz,
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 o_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
-            ).start()
+            )
 
     def wait_out(
         self,
@@ -498,11 +506,12 @@ class BatchingLSERef(pltpu.BufferedRef):
 
         q_sizes = self._written_q_sizes(schedule_ref, grid_indices[0])
         for b, (q_src, q_sz) in enumerate(q_sizes):
-            pltpu.make_async_copy(
+            _start_if(
+                q_sz,
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
-            ).start()
+            )
 
     def wait_out(
         self,
@@ -582,11 +591,12 @@ class BatchingQRef(pltpu.BufferedRef):
 
         for i in range(len(dma_list)):
             q_src, q_sz, b = dma_list[i]
-            pltpu.make_async_copy(
+            _start_if(
+                q_sz,
                 q_hbm.at[:, pl.ds(q_src, q_sz)],
                 vmem_dst.at[b, :, pl.ds(0, q_sz)],
                 sem,
-            ).start()
+            )
 
     def wait_in(
         self,

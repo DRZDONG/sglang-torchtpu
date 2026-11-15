@@ -37,17 +37,8 @@ SMALL = dict(
     wo_s=11,
     wpool_s=12,
     wunpool_s=13,
-    # NVFP4 per-expert global scales (scale_fp8): gate in lanes [0, Ep), up in [Ep, 2 Ep)
-    expert_gs=14,
-    # and down in lanes [0, Ep)
-    expert_gs_down=15,
 )
 SMALL_ROWS = 16
-# attn_preones: u32 rows per ring chunk (64 of K/V words + 8 of fp8 ones) and slot cap
-PREONES_ROWS = 72
-PREONES_MAX_SLOTS = 24
-# four e4m3 1.0 bytes in one u32 word
-_FP8_ONES_WORD = 0x38383838
 
 
 def small_row(smr, name: str, n: int | None = None):

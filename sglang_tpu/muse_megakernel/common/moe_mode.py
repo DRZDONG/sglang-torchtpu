@@ -7,7 +7,7 @@ from typing import Literal
 from sglang_tpu.envs import envs as tpu_envs
 
 # tp: 1/tp of every expert per rank (expert-TP megakernel, fused-RS expert-TP prefill MoE);
-# ep: whole experts per rank (decode/ep megakernel, EP prefill MoE).
+# ep: whole experts per rank (decode/spep megakernel, EP prefill MoE).
 MoeMode = Literal["tp", "ep"]
 
 _LEGACY_ENV = "MUSE_PF_MOE_EP"

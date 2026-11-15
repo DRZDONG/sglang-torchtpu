@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MKConfig: the static description of one compiled megakernel step."""
+"""Static descriptions of the compiled Muse programs: MKConfig (decode megakernel step) and
+PFConfig (prefill program), over their shared MuseGeometry."""
 
 import math
 
@@ -9,8 +10,6 @@ import msgspec
 from sglang_tpu.muse_megakernel.common.consts import (
     FP4_PACK,
     LANE,
-    PREONES_MAX_SLOTS,
-    PREONES_ROWS,
     QBLOCK_SIZES,
     UNSHIFTED_MAX,
 )
@@ -26,8 +25,8 @@ from sglang_tpu.muse_megakernel.common.tables import (
 )
 
 
-class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """Static description of one compiled megakernel (model geometry + step shape)."""
+class MuseGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-device model geometry and step rows, shared by the decode and prefill programs."""
 
     hidden: int
     head_dim: int
@@ -37,7 +36,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     n_experts: int
     top_k: int
     expert_hidden: int
-    inter_local: int
     tp: int
     rms_eps: float
     post_eps: float
@@ -48,15 +46,39 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     router_eps: float
     window: int
     global_layers: tuple  # NoPE + full attention
+    capture_layers: tuple  # aux hidden-state layers for the draft model
+    rows: int  # padded token rows of the step
+    # [lo, hi) fp4 layer ranges whose expert slabs arrive stacked ([hi - lo, E, ...] per slab),
+    # so the rolled loop picks a range by a small compare tree and indexes the layer in it
+    expert_groups: tuple = ()
+
+    @property
+    def q_dim(self) -> int:
+        return self.q_heads * self.head_dim
+
+    @property
+    def kv_dim(self) -> int:
+        return self.kv_heads * self.head_dim
+
+    @property
+    def qkvg_dim(self) -> int:
+        return 2 * self.q_dim + 2 * self.kv_dim
+
+    def use_rope(self, layer: int) -> bool:
+        return layer not in self.global_layers
+
+
+class MKConfig(MuseGeometry, frozen=True, kw_only=True):
+    """Static description of one compiled megakernel (model geometry + step shape)."""
+
+    inter_local: int
     expert_kinds: tuple  # per layer: "fp4" | "fp8"
     page_size: int
     pages_per_seq: int
     n_pages_entries: int  # length of the flattened page tables
     max_position: int  # rope table rows
-    rows: int  # padded rows R (multiple of tp)
     rows_per_req: int  # 1 at decode, the verify block at target-verify
     n_req: int  # requests in the bucket
-    capture_layers: tuple  # aux hidden-state layers for the draft model
     pool_padded_head_dim: int = 128
     # streaming
     tile_k: int = 1024
@@ -77,15 +99,10 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     compact_arms: tuple = ()
     # router top-k by k rounds of row max (_topk_iter) instead of per-row ranks
     topk_iter: bool = False
-    # an expert waits for its w13 slabs only, then for w2 just before the down projection
-    ex_split_wait: bool = True
     # fp4 experts: every other iteration issues the next two experts in one layer-branch walk
     # (~0.03 us per expert less). Its looped leaves grow the expert loop's code: with per-layer
     # expert operands (62 leaves) the loop no longer fits the instruction memory.
     ex_issue_pairs: bool = False
-    # fp4 experts carry e4m3 block scales plus per-expert globals (smalls rows expert_gs*)
-    # instead of bf16 scales with the globals folded in (10% fewer expert bytes)
-    scale_fp8: bool = False
     # in a step of at most few_rows_max rows (n_req * rows_per_req), the o-proj all-reduce is one
     # gather of those rows' partials (one latency phase instead of two) and the ffn-output
     # gather ships only those rows
@@ -101,12 +118,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # (kv_heads * head_dim == pool_padded_head_dim) instead of one zero-padded row per head:
     # half the KV bytes and attention work at head_dim 64. The serving pool must match.
     kv_packed: bool = False
-    # every layer in one rolled loop (expert kind picked per layer by a branch) instead of
-    # emitting the non-fp4 layers statically: one copy of the layer body
-    unify_layers: bool = False
-    # [lo, hi) fp4 layer ranges whose expert slabs arrive stacked ([hi - lo, E, ...] per slab),
-    # so the rolled loop picks a range by a small compare tree and indexes the layer in it
-    expert_groups: tuple = ()
     # distinct experts, their (row, slot) groups and the y-block ends from vector ops and one
     # DMA to SMEM instead of scalar SMEM loops
     vec_route: bool = True
@@ -131,8 +142,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # which go through VMEM; the ring (kv_group >= attn_streams) is refilled one iteration ahead.
     attn_pipe: bool = False
     attn_streams: int = 4
-    # debug: attention reads this step's own K/V rows at bf16 precision whatever the pool dtype
-    debug_own_kv_bf16: bool = False
     # ship each finished wo column tile to its reduce-scatter owner during the o-proj matvec
     o_rs_streamed: bool = True
     # with o_rs_streamed: each device streams the wo column tiles from its next peer's block on,
@@ -145,8 +154,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     # peer order of a round's sends: "ring" (me+1, me+2, ...) or "xor" (me^1, me^2, ...; ring
     # unless tp is a power of two)
     coll_order: str = "xor"
-    # a round starts its remote copies before copying its own part into its pad
-    coll_local_last: bool = True
     # Not bit-exact. The unpooler all-gather folds into the next layer's qkvg matvec: the
     # attention-input RMS is a per-row scalar, so qkvg = r * ((alpha x + s_f beta f wp) g) @ W,
     # the x and f parts one stacked dot per K block, each f block consumed as it arrives (own
@@ -154,13 +161,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     fold_f: bool = False
     # Not bit-exact. The o-proj all-gather folds into the pooler and router matvecs the same way.
     fold_o: bool = False
-    # LAZY dense refill: refills of tiles consumed after the expert phase (the unpooler's and
-    # the next layer's), due while pool / router stream, are held until the expert loop ends
-    # so they do not compete with the expert DMAs.
-    lazy_dense: bool = True
-    # the next layer's smalls are fetched right after this layer's attention instead of after
-    # its unpooler (where they queue behind the LAZY refills; fold_f leaves no f wait to hide them)
-    smalls_early: bool = True
     # > 0: row-tiled program for steps past the base program's VMEM (ported from
     # sglang-torchtpu-mkrows): the residual stream, collective pads and expert outputs live in
     # HBM and every per-row pass runs row_tile rows at a time, so VMEM barely grows with rows.
@@ -171,7 +171,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     expert_chunk: int = 32
     # optimization flags (all default off on MKConfig; enabled by decode_config)
     ex_opt: bool = False
-    ex_kperm: int = 0
     tiled_vmem_y: int = 0
     tiled_o_rot: bool = False
     tiled_vmem_pads: bool = False
@@ -184,14 +183,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     pipe_ag: bool = False
     tiled_fold: bool = False
     attn_opt: int = 0
-    # fp8 SAL global attention on steps of more than 64 attention rows per request: each ring
-    # chunk owns 72 u32 rows of the expert w13 slots ([K0; V0; K1; V1] then 8 rows of fp8 ones,
-    # written once per layer), so QK is one 256-deep dot on the raw chunk and PV one dot
-    # against [V0; K1; V1; ones] whose ones lanes give the softmax row sums on the MXU (one
-    # f32 accumulator, no VPU row-sum adds). The HBM pool layout is unchanged.
-    attn_preones: bool = False
-    # with attn_preones: queries go to the MXU as per-row-scaled fp8
-    attn_q_fp8: bool = False
     # pipelined_opt loop carry for > 64 attention rows: 0 one lane-partial row sum per stream
     # (NS x [M, 128]) and 2 accumulators; 1 one row sum (tree-summed per chunk) and one
     # accumulator; 2 one row sum and 2 accumulators
@@ -217,16 +208,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     y_quant: int = 0
     combine_loop: bool = False
     untiled_max_rows: int = 128
-    bd_fp8_lhs: bool = False
     bd_n_tile: int = 0
-    vec_dequant_kperm: bool = False
-    ex_fp8_lhs: bool = False
-    ex_bd_max_rows: int = 0
-    dense_fp8_lhs: bool = False
-    attn_p_fp8: bool = False
     topk_xpose: bool = False
     ex_w2_stage: bool = False
-    ex_gs_smem: bool = False
     ex_lhs_fp8: int = 0
     pair_y_stream: bool = False
     sal_kv_split: bool = False
@@ -238,18 +222,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     qblock: int = 0
     # dense weights left out of the ring (an FFN-section hook streams its own copies)
     dense_skip: tuple = ()
-
-    @property
-    def q_dim(self):
-        return self.q_heads * self.head_dim
-
-    @property
-    def kv_dim(self):
-        return self.kv_heads * self.head_dim
-
-    @property
-    def qkvg_dim(self):
-        return 2 * self.q_dim + 2 * self.kv_dim
 
     @property
     def g(self):
@@ -303,31 +275,7 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     @property
-    def preones_slots(self):
-        """attn_preones ring chunks: 72-row slots of the expert w13 slots, at most 24."""
-        rows = (self.expert_depth + 1) * (self.expert_hidden // FP4_PACK)
-        return min(PREONES_MAX_SLOTS, rows // PREONES_ROWS)
-
-    @property
-    def use_sal_preones(self):
-        return bool(
-            self.attn_preones
-            and self.kv_sal
-            and self.kv_sal_fp8
-            and self.sal_fp8_dot >= 2
-            and self.attn_exp2
-            and self.attn_pipe
-            and self.kv_heads == 2
-            and self.head_dim == 64
-            and self.sal_words == 64
-            and self.chunk_pages * self.page_size == 2 * self.inter_local
-            and self.preones_slots >= 2 * self.attn_streams
-        )
-
-    @property
     def kv_ring(self):
-        if self.use_sal_preones:
-            return self.preones_slots
         if self.kv_sal:  # every chunk the expert w13 slots hold (sal_kv_view)
             return (
                 (self.expert_depth + 1)
@@ -354,9 +302,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
     def rows_per_dev(self):
         return self.rows // self.tp
 
-    def use_rope(self, l):
-        return l not in self.global_layers
-
     def _validate_qblock(self):
         if self.qblock not in QBLOCK_SIZES:
             raise ValueError(
@@ -370,11 +315,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(
                     f"SGLANG_TPU_MUSE_MK_QBLOCK={self.qblock}: {name}={k} is not a multiple"
                 )
-        if self.scale_fp8 or self.ex_kperm >= 3 or self.bd_fp8_lhs:
-            raise ValueError(
-                "SGLANG_TPU_MUSE_MK_QBLOCK needs bf16 block scales and a bf16 expert LHS "
-                "(scale_fp8, ex_kperm >= 3 and bd_fp8_lhs are off)"
-            )
 
     def validate(self):
         assert self.rows % self.tp == 0 and self.rows >= self.tp
@@ -420,10 +360,9 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
         assert self.sal_fp8_dot == 0 or self.kv_sal_fp8
         assert not self.swa_chunk_pages or (
             self.kv_sal
-            and not self.use_sal_preones
             and 0 < self.swa_chunk_pages < self.chunk_pages
-            and self.chunk_pages % self.swa_chunk_pages == 0
-            and (self.swa_chunk_pages * self.page_size) % LANE == 0
+            and (self.chunk_pages % self.swa_chunk_pages == 0)
+            and (self.swa_chunk_pages * self.page_size % LANE == 0)
         )
         assert not self.attn_col_mask or self.swa_chunk_pages
         assert not self.fold_attn_scale or math.frexp(self.attn_scale)[0] == 0.5
@@ -451,7 +390,6 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
                 and self.tp & (self.tp - 1) == 0
                 and self.coll_order == "xor"
             )
-            assert not self.unify_layers, "layer 0 has no pending all-gather to fold"
             few = (
                 self.single_row_coll
                 and self.n_req * self.rows_per_req <= self.few_rows_max
@@ -475,11 +413,7 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             and self.row_tile % 16 == 0
             and self.rows % self.tp == 0
             and owner_window_rows(self) <= self.rows
-            and not (
-                ((self.fold_f or self.fold_o) and not self.tiled_vmem_pads)
-                or self.scale_fp8
-                or self.unify_layers
-            )
+            and not ((self.fold_f or self.fold_o) and not self.tiled_vmem_pads)
             and not (
                 self.single_row_coll
                 and self.n_req * self.rows_per_req <= self.few_rows_max
@@ -500,4 +434,51 @@ class MKConfig(msgspec.Struct, frozen=True, kw_only=True):
             and self.expert_chunk >= self.compact_rows
             and self.vec_route
         )
+        return self
+
+
+# ---------------------------------------------------------------- prefill program
+# The grid collectives (common.coll.GridColl) route over a 2x2 grid of two-core chips.
+PREFILL_TP = 8
+# Row tiles of the fused kernels; larger ones overflow VMEM.
+ATTN_OUT_TILE = 64
+POST_MOE_TILE = 128
+# post_moe tiles POST_MOE_TILE rows as POST_MOE_TILE / tp rows of each rank's token block.
+ROW_ALIGN = POST_MOE_TILE
+# the SP program has no post_moe tiling: rows split evenly over tp ranks, 2+ rows each
+SP_ROW_ALIGN = 16
+
+
+class PFConfig(MuseGeometry, frozen=True, kw_only=True):
+    """Model geometry (per device) and chunk shape of one compiled prefill program."""
+
+    # the expert-input and post-expert-projection all-gathers carry e4m3 blocks, one scale each
+    fp8_gather: bool = False
+    # layers whose fp4 experts are block-requantized (SGLANG_TPU_MUSE_MK_QBLOCK): W4A16 MoE
+    w4a16_layers: tuple = ()
+    # sequence-parallel layout (prefill/spep): each rank owns rows / tp rows between layers, and
+    # the MoE runs on whole experts (EP) behind ragged all-to-alls
+    sp: bool = False
+    # per layer "fp4" / "fp8": the SP program's expert dot kinds
+    expert_kinds: tuple = ()
+    # SGLANG_TPU_MUSE_MK_PREFILL_SP_DEBUG_HP: SP dense activations in f32 (numerics A/B)
+    sp_debug_hp: bool = False
+    # SGLANG_TPU_MUSE_MK_SP_O_RS: o-proj RS by row on this rank's wo slice (decode target (8))
+    sp_o_rs: bool = False
+    # SGLANG_TPU_MUSE_MK_SP_COL_POOL: pooler / unpooler column-sliced over ranks (target (9))
+    sp_col_pool: bool = False
+    # SGLANG_TPU_MUSE_MK_SP_EP_LAYOUT: experts / pool / unpool in decode EP's layout
+    sp_ep_layout: bool = False
+
+    def validate(self) -> "PFConfig":
+        if self.tp != PREFILL_TP:
+            raise ValueError(
+                f"the Muse prefill program runs at TP {PREFILL_TP}, got {self.tp}"
+            )
+        align = SP_ROW_ALIGN if self.sp else ROW_ALIGN
+        if self.rows % align:
+            raise ValueError(
+                f"{self.rows}-row extend step: the Muse prefill program needs multiples of "
+                f"{align} (tpu_compile_tokens)"
+            )
         return self

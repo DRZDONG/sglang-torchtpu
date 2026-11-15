@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The hooks of the row-tiled program (decode/ep/): build_kernel(cfg, ep=hook) runs hook.o_proj
+"""The hooks of the row-tiled program (decode/spep/): build_kernel(cfg, ep=hook) runs hook.o_proj
 in place of the o-proj reduce-scatter / all-gather and the post-attention residual, and
 hook.layer_moe in place of the pool, router, expert-TP loop, unpool and FFN residual, and
 hook.pre_attn in place of the next layer's pre-attention norm."""

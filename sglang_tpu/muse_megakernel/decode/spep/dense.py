@@ -11,7 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang_tpu.muse_megakernel.common.config import MKConfig
-from sglang_tpu.muse_megakernel.decode.ep.config import DN_TK, DN_TN
+from sglang_tpu.muse_megakernel.decode.spep.config import DN_TK, DN_TN
 
 
 def _tile_copies(S: dict, w_hbm, layer, K: int, N: int, n_off, tn: int):

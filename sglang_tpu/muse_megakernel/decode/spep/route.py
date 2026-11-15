@@ -11,7 +11,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
 from sglang_tpu.muse_megakernel.common.numerics import _topk_iter
-from sglang_tpu.muse_megakernel.decode.ep.config import SEG, TAB_ROWS, EPPlan
+from sglang_tpu.muse_megakernel.decode.spep.config import SEG, TAB_ROWS, EPPlan
 
 
 def _ceil_seg(x):

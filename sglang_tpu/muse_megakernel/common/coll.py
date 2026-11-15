@@ -69,7 +69,6 @@ class Coll:
         ssems,
         rsems,
         order="ring",
-        local_last=False,
         pair_ag=0,
         pair_ssems=None,
         pair_rsems=None,
@@ -79,7 +78,6 @@ class Coll:
         self.pads, self.ssems, self.rsems = pads, ssems, rsems
         self.kinds = {k: i for i, k in enumerate(pads)}
         self.order = order if tp & (tp - 1) == 0 else "ring"
-        self.local_last = local_last
         self.pair_ag = pair_ag if (tp == 8 and pair_ssems is not None) else 0
         self.pair_ssems = pair_ssems
         self.pair_rsems = pair_rsems
@@ -101,14 +99,6 @@ class Coll:
             device_id=(peer,),
         )
 
-    def _local(self, fn, issued):
-        """The round's own-part copy: before its remote copies, or after them with
-
-        local_last (``issued`` False / True).
-        """
-        if self.local_last == issued:
-            fn()
-
     def all_gather(self, kind, src_ref, slot, live=None):
         """``src_ref`` from every device into ``pad[slot_of_sender]``; returns the pad ref.
 
@@ -123,7 +113,6 @@ class Coll:
         def local():
             pad[slot] = src_ref[...]
 
-        self._local(local, False)
         cps = [
             self._copy(kind, src_ref, pad.at[slot], self._peer(d))
             for d in range(1, self.tp)
@@ -133,12 +122,11 @@ class Coll:
         def _():
             for c in cps:
                 c.start()
-            self._local(local, True)
+            local()
             for c in cps:
                 c.wait_send()
 
-        if self.local_last:
-            pl.when(jnp.logical_not(live(self.me)))(local)
+        pl.when(jnp.logical_not(live(self.me)))(local)
         for d, c in zip(range(1, self.tp), cps):
 
             @pl.when(live(self._peer(d)))
@@ -199,14 +187,13 @@ class Coll:
         def local():
             pad[slot] = src_ref[...]
 
-        self._local(local, False)
         cps = [
             self._copy(kind, src_ref, pad.at[slot], self._peer(d))
             for d in range(1, self.tp)
         ]
         for c in cps:
             c.start()
-        self._local(local, True)
+        local()
 
         def wait():
             for c in cps:
@@ -249,10 +236,9 @@ class Coll:
         def local():
             pad[slot] = src_ref[...]
 
-        self._local(local, False)
         for d in range(1, self.tp):
             self._block_copy_to(kind, src_ref, slot, rsems, self._peer(d)).start()
-        self._local(local, True)
+        local()
 
     def all_gather_blocks_wait(self, kind, src_ref, slot, rsems):
         """(wait_block(k), finish()) of an all_gather_blocks_start: the first waits
@@ -359,7 +345,6 @@ class Coll:
                     pl.ds(pl.multiple_of(self.me * rows_per, rows_per), rows_per)
                 ]
 
-        self._local(local, False)
         cps = []
         for d in range(1, self.tp):
             peer = self._peer(d)
@@ -367,7 +352,7 @@ class Coll:
         if not started:
             for peer, cp in cps:
                 pl.when(peer * rows_per < n_live)(cp.start)
-        self._local(local, True)
+        local()
         for peer, cp in cps:
             pl.when(peer * rows_per < n_live)(cp.wait_send)
 
@@ -393,14 +378,13 @@ class Coll:
                 :, pl.ds(pl.multiple_of(self.me * width, LANE), width)
             ]
 
-        self._local(local, False)
         cps = [
             self._cols_copy(kind, src_ref, width, self._peer(d))
             for d in range(1, self.tp)
         ]
         for c in cps:
             c.start()
-        self._local(local, True)
+        local()
         for c in cps:
             c.wait()
         return pad

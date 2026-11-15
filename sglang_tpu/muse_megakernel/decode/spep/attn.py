@@ -13,7 +13,7 @@ from sglang_tpu.muse_megakernel.common.consts import small_row
 from sglang_tpu.muse_megakernel.common.hooks import EPOProjStep
 from sglang_tpu.muse_megakernel.common.numerics import _rms
 from sglang_tpu.muse_megakernel.common.packing import _pack_bf16x2, _unpack_bf16x2
-from sglang_tpu.muse_megakernel.decode.ep.config import EPPlan, window_rows
+from sglang_tpu.muse_megakernel.decode.spep.config import EPPlan, window_rows
 
 f32, bf16 = jnp.float32, jnp.bfloat16
 

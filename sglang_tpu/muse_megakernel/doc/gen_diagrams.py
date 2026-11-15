@@ -229,7 +229,7 @@ PREFILL_SP = Column(
     title="(2) Prefill SP + EP8, wave 1 (MK_PREFILL_SP=1)",
     subtitle=(
         "Residual row-sharded (own R/8 rows); attn gathers all R rows, split by head. MoE:",
-        "EP8, 32 whole experts per rank, remote-DMA a2a (sp/a2a.py). Wave 1 dtypes (uncommitted)",
+        "EP8, 32 whole experts per rank, remote-DMA a2a (common/a2a.py). Wave 1 dtypes (uncommitted)",
     ),
     block_rows=PREFILL_BLOCK_ROWS,
     n_ops=5,
@@ -655,8 +655,8 @@ DECODE_EP_GATHER_TARGET = Column(
             ),
             C(
                 "attention",
-                "head-RMS f32 -> q fp8 e4m3 (attn_q_fp8); K/V fp8 e4m3",
-                "P fp8 e4m3 (attn_p_fp8); QK / PV acc f32",
+                "head-RMS f32 -> q fp8 e4m3; K/V fp8 e4m3",
+                "P fp8 e4m3; QK / PV acc f32",
             ),
             C(
                 "o_proj (fp8 x fp8)",
@@ -840,8 +840,8 @@ DECODE_EP_A2A_TARGET = Column(
             ),
             C(
                 "attention",
-                "head-RMS f32 -> q fp8 e4m3 (attn_q_fp8); K/V fp8 e4m3",
-                "P fp8 e4m3 (attn_p_fp8); QK / PV acc f32",
+                "head-RMS f32 -> q fp8 e4m3; K/V fp8 e4m3",
+                "P fp8 e4m3; QK / PV acc f32",
             ),
             C(
                 "o_proj (fp8 x fp8)",
@@ -900,6 +900,124 @@ DECODE_EP_A2A_TARGET = Column(
                 "⇄ next-layer input AG (fp8 + scale)",
                 7,
                 "own rows pre_attn-normed fp8 e4m3 + scale -> all ep_lhs_g",
+            ),
+        ),
+    },
+)
+
+DECODE_EP_A2A_SLICED = Column(
+    key="decode_ep_a2a_sliced",
+    dma={
+        "Attention": (26, 24.25),
+        "Pooler": (8, 16),
+        "MoE": (0, 28),
+        "Unpooler": (4, 8),
+    },
+    expert_layout="ep",
+    dma_note="column slices of wpool / wunpool (4 + 4 MiB): TP's 38 MiB; ffn AG pad [R, H] e4m3 in HBM",
+    title="(9) Decode SP + EP target, pool / unpool column-sliced",
+    subtitle=(
+        "(8) with pool / unpool on a 1/8 column slice of the replicated weights (as (5)) instead",
+        "of in full on own rows: + ffn AG, pool a2a, u AG, f a2a. Slicing: MK_SP_COL_POOL (prefill SP)",
+    ),
+    block_rows=DECODE_BLOCK_ROWS,
+    n_ops=8,
+    sections={
+        "Attention": (
+            X(
+                "⇄ a_in AG (fp8 + row scale)",
+                7,
+                "own rows pre_attn-normed [R/8, H] fp8 e4m3 + f32 -> [R, H]",
+            ),
+            C(
+                "qkvg (fp8 x fp8) + attention (by head, all R rows)",
+                "a_in fp8 e4m3 @ wqkvg fp8 e4m3 -> f32 acc",
+                "q fp8 e4m3; K/V fp8 e4m3; P fp8 e4m3; acc f32",
+            ),
+            C(
+                "o_proj (row block of the replicated wo, fp8 x fp8)",
+                "gated fp8 e4m3 @ wo[1024 rows, H] fp8 e4m3 -> partial [R, H] f32",
+                note="the same replicated wo SP prefill reads; 8 of its 64 MiB",
+            ),
+            X(
+                "⇄ o RS (by row, bf16: feeds post-attn norm)",
+                14,
+                "[R/8, H/8] bf16 blocks -> owner, f32 sum",
+            ),
+            C(
+                "attention residual (own rows)",
+                "post-attn RMS f32; stream [R/8, H] f32",
+            ),
+        ),
+        "Pooler": (
+            C(
+                "pre-FFN norm + router (own rows, open)",
+                "ffn bf16 @ wrouter bf16 -> f32 -> top8 [R/8, 8]",
+                "ffn -> fp8 e4m3 + row scale f32",
+            ),
+            X(
+                "⇄ ffn AG (fp8 + row scale)",
+                7,
+                "[R/8, H] fp8 e4m3 + [R/8, 1] f32 -> [R, H]",
+            ),
+            C(
+                "pooler (column slice, fp8 x fp8, all R rows)",
+                "ffn fp8 e4m3 @ wpool[:, 512 cols] fp8 e4m3 -> [R, He/8] f32",
+                note="reads 4 MiB of the 32 MiB replicated weight",
+            ),
+            X(
+                "⇄ pool a2a (by row, bf16: feeds pre-expert norm)",
+                0.875,
+                "[R, He/8] bf16 -> owner [R/8, 8 x He/8] bf16",
+            ),
+            C(
+                "pre-expert norm (own rows)",
+                "RMS f32 -> xe [R/8, He] fp8 e4m3 + row scale f32",
+            ),
+        ),
+        "MoE": (
+            X("⇄ count exchange", 7 / 64, "[256] int32 to 7 peers"),
+            X(
+                "⇄ dispatch a2a (remote DMA, fp8 u32-packed)",
+                5.55,
+                "row = 1152 u32 (pack_rows): e4m3 bytes, f32 scale, pad",
+                "one segment per (source, destination), SEG=8-row DMAs",
+                note="per-(source, expert) SEG=8 segments would pad 7.17x at R=64 (28 KiB/row)",
+            ),
+            C(
+                "experts (EP, whole experts)",
+                "xe fp8 e4m3 x NVFP4 e2m1 / fp8 e4m3; h -> fp8 e4m3; acc f32",
+                "y -> bf16 (feeds post-expert norm)",
+            ),
+            X(
+                "⇄ y return (bf16)",
+                7,
+                "per slot bf16 -> source ep_yb",
+            ),
+            C(
+                "combine (own rows)",
+                "post-expert RMS f32 x w, sum f32 -> u [R/8, He] fp8 e4m3 + scale",
+            ),
+        ),
+        "Unpooler": (
+            X(
+                "⇄ u AG (fp8 + row scale)",
+                3.5,
+                "[R/8, He] fp8 e4m3 + [R/8, 1] f32 -> [R, He]",
+            ),
+            C(
+                "unpooler (column slice, fp8 x fp8, all R rows)",
+                "u fp8 e4m3 @ wunpool[:, 1024 cols] fp8 e4m3 -> [R, H/8] f32",
+                note="reads 4 MiB of 32 MiB",
+            ),
+            X(
+                "⇄ f a2a (by row, bf16: feeds post-FFN norm)",
+                1.75,
+                "[R, H/8] bf16 -> owner [R/8, 8 x H/8] bf16",
+            ),
+            C(
+                "post-FFN norm + residual (own rows)",
+                "RMS f32; stream [R/8, H] f32; next pre-attn norm fused",
             ),
         ),
     },
@@ -1048,6 +1166,42 @@ FORMULAS = {
         "decode_ep_a2a_target",
         "⇄ next-layer input AG (fp8 + scale)",
     ): "7/8 x H x 1B = 7/8 x 8192 x 1 = 7 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ a_in AG (fp8 + row scale)",
+    ): "7/8 x H x 1B = 7/8 x 8192 x 1 = 7 KiB (+ 3.5 B row scale)",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ o RS (by row, bf16: feeds post-attn norm)",
+    ): "7/8 x H x 2B = 7/8 x 8192 x 2 = 14 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ ffn AG (fp8 + row scale)",
+    ): "7/8 x H x 1B = 7/8 x 8192 x 1 = 7 KiB (+ 3.5 B row scale)",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ pool a2a (by row, bf16: feeds pre-expert norm)",
+    ): "7/8 x (He/8) x 2B = 7/8 x 512 x 2 = 0.875 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ count exchange",
+    ): "7 peers x 256 x 4B = 7 KiB per layer; / R=64 = 0.11 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ dispatch a2a (remote DMA, fp8 u32-packed)",
+    ): "1/8 own rows x 8 slots x 1152 u32 x 4B x 7/8 = 3.94 KiB\nx 1.41 (8-row segment padding, simulated at R=64) = 5.55 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ y return (bf16)",
+    ): "1/8 own rows x 8 slots x He x 2B x 7/8\n= 1/8 x 8 x 4096 x 2 x 7/8 = 7 KiB",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ u AG (fp8 + row scale)",
+    ): "7/8 x He x 1B = 7/8 x 4096 x 1 = 3.5 KiB (+ 3.5 B row scale)",
+    (
+        "decode_ep_a2a_sliced",
+        "⇄ f a2a (by row, bf16: feeds post-FFN norm)",
+    ): "7/8 x (H/8) x 2B = 7/8 x 1024 x 2 = 1.75 KiB",
 }
 
 
@@ -1074,6 +1228,7 @@ COLUMNS = tuple(
         DECODE_EP_GATHER_TARGET,
         DECODE_EP_A2A,
         DECODE_EP_A2A_TARGET,
+        DECODE_EP_A2A_SLICED,
     )
 )
 
@@ -1314,7 +1469,7 @@ def render(columns: tuple[Column, ...]) -> str:
         "HBM DMA = fixed weights + E(R) experts + per-row KiB x R, per layer per rank (estimate: each HBM",
         "  tensor written once, read once); E(R) = 780 MiB x (1 - (31/32)^R), x EP worst-rank imbalance;",
         "  tile re-reads and XLA fusion not modeled; fp4 experts at QBLOCK=256 (3.05 MiB per expert-TP slice)",
-        "Decode columns (4)-(8) all use R=64 (spec decoding), so their numbers compare directly",
+        "Decode columns (4)-(9) all use R=64 (spec decoding), so their numbers compare directly",
         "decode packs bf16 pairs into u32 words (common/packing.py)",
         "FP8_GATHER only affects the xe / u AG of (1); (2) rejects it",
         "(2) is uncommitted wave 1: it requires MOE_MODE=ep, which serving still rejects",

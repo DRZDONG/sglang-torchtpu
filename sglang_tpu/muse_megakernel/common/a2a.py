@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The SP prefill MoE's all-to-alls by remote DMA, straight into expert-grouped order.
+"""All-to-all by remote DMA for the Muse SP + EP programs, decode (decode/spep megakernel,
+in-kernel) and prefill (prefill/spep, XLA-level pallas_calls).
 
-Sender m sorts its (row, slot) pairs by global expert g = d * El + e (d the expert's rank).
-Receiver d lays out what it gets by local expert, then by source rank: the expert FFN reads
-that buffer as is, with no reorder of the received rows. Every (source, expert) segment
-starts on a SEG-row boundary on both sides, so it moves as whole-tile SEG-row DMAs; the
-combine sends each segment's outputs back into the source's padded copy of its sorted order.
+Shared pieces: segments of rows start on SEG-row boundaries, move as SEG-row DMAs (local when
+the peer is this rank, remote otherwise) and are waited for chunk by chunk (seg_copy,
+wait_chunks).
 
-Streaming: local experts form n_chunks chunks. Send kernels only start DMAs and return their
-semaphores ([chunk, recv / sent]); wait kernels block on one chunk. The caller runs chunk
-j's expert FFN while chunk j + 1 arrives and chunk j - 1 returns.
+Prefill (plan / pack_rows / unpack_rows / exchange): sender m sorts its (row, slot) pairs by
+global expert g = d * El + e (d the expert's rank); receiver d lays out what it gets by local
+expert, then by source, so the expert FFN reads the buffer as is. Every (source, expert)
+segment starts on a SEG-row boundary on both sides; the combine sends each segment's outputs
+back into the source's padded copy of its sorted order. Local experts form n_chunks chunks:
+send kernels only start DMAs and return their semaphores, wait kernels block on one chunk, so
+chunk j's expert FFN runs while chunk j + 1 arrives and chunk j - 1 returns. Dispatch rows
+are u32 words (pack_rows): byte b of word c holds e4m3 element b * He / 4 + c, so unpack_rows
+decodes lane-aligned slices; word He / 4 holds the f32 scale.
 
-Dispatch rows are u32 words (pack_rows): byte b of word c holds e4m3 element b * He / 4 + c,
-so unpack_rows decodes lane-aligned slices with no relayout; word He / 4 holds the f32 scale.
+Decode (mk_*): inside the EP megakernel, every rank's slot counts first (one row each), then
+per (source, destination) one contiguous segment of slot rows; the y rows go back one by one
+from the expert loop (decode/spep/layer.py).
 """
 
 from typing import NamedTuple
@@ -22,14 +28,52 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang_tpu.muse_megakernel.common.config import MKConfig
 from sglang_tpu.muse_megakernel.common.consts import (
     LANE,
     SP_COMBINE_COLLECTIVE_ID,
     SP_DISPATCH_COLLECTIVE_ID,
 )
 
+SEG = 8  # rows per DMA: an HBM (8, 128) tile of u32 / bf16 rows (offsets must be tile-aligned)
+
+
+def seg_copy(src_buf, dst_buf, s0, d0, i, peer, me, recv, sent) -> None:
+    """Start chunk i (SEG rows) of the segment at src_buf row s0 into peer's dst_buf row d0.
+    The receiver's recv semaphore counts it; a remote copy also counts on this rank's sent."""
+    src = src_buf.at[pl.ds(pl.multiple_of(s0 + i * SEG, SEG), SEG)]
+    dst = dst_buf.at[pl.ds(pl.multiple_of(d0 + i * SEG, SEG), SEG)]
+
+    @pl.when(peer == me)
+    def _():
+        pltpu.make_async_copy(src, dst, recv).start()
+
+    @pl.when(peer != me)
+    def _():
+        pltpu.make_async_remote_copy(
+            src_ref=src,
+            dst_ref=dst,
+            send_sem=sent,
+            recv_sem=recv,
+            device_id=(peer,),
+            device_id_type=pl.DeviceIdType.MESH,
+        ).start()
+
+
+def wait_chunks(buf, sem, n, rows: int = SEG) -> None:
+    """Wait for n DMAs of `rows` rows of buf on sem (DMA semaphores count bytes)."""
+    tmpl = pltpu.make_async_copy(buf.at[pl.ds(0, rows)], buf.at[pl.ds(0, rows)], sem)
+
+    def one(_, carry):
+        tmpl.wait()
+        return carry
+
+    jax.lax.fori_loop(0, n, one, 0)
+
+
+# ===== prefill (prefill/spep) =====
+
 # rows per DMA and segment alignment: DMA offsets must be HBM-tile aligned (8 rows of u32 / bf16)
-SEG = 8
 # each expert's group starts on this row in the receive buffer: gmm_v2 faults (TPU
 # UserFatalError) on bf16 groups starting off a 16-row tile; the gap rows are never sent
 GROUP_ALIGN = 16
@@ -199,6 +243,47 @@ def unpack_rows(words, lo, hi, he: int):
     )(blk, words)
 
 
+def silu_mul_chunks(h, lo, hi, chunk: int):
+    """bf16 [cap, 2I] w13 outputs whose columns are per-chunk [gate | up] (decode/spep
+    chunk_cols) -> bf16 [cap, I] silu(gate) * up, chunk by chunk in lane-aligned slices;
+    only the UNPACK_ROWS blocks covering rows [lo, hi) are computed (no relayout of the
+    whole receive buffer)."""
+    cap, two_i = h.shape
+    n = two_i // (2 * chunk)
+    if cap % UNPACK_ROWS:
+        raise ValueError(f"receive rows {cap} not a multiple of {UNPACK_ROWS}")
+
+    def kernel(blk_ref, h_ref, o_ref):
+        @pl.when(blk_ref[0] + pl.program_id(0) < blk_ref[1])
+        def _():
+            for j in range(n):
+                g = h_ref[:, 2 * j * chunk : (2 * j + 1) * chunk].astype(jnp.float32)
+                u = h_ref[:, (2 * j + 1) * chunk : (2 * j + 2) * chunk].astype(
+                    jnp.float32
+                )
+                o_ref[:, j * chunk : (j + 1) * chunk] = (jax.nn.silu(g) * u).astype(
+                    o_ref.dtype
+                )
+
+    def block(i, blk):
+        return (jnp.minimum(blk[0] + i, jnp.maximum(blk[1] - 1, blk[0])), 0)
+
+    blk = jnp.stack([lo // UNPACK_ROWS, (hi + UNPACK_ROWS - 1) // UNPACK_ROWS]).astype(
+        jnp.int32
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((cap, two_i // 2), jnp.bfloat16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(cap // UNPACK_ROWS,),
+            in_specs=[pl.BlockSpec((UNPACK_ROWS, two_i), block)],
+            out_specs=pl.BlockSpec((UNPACK_ROWS, two_i // 2), block),
+        ),
+        name="sp_moe_silu_mul",
+    )(blk, h)
+
+
 def _send(
     tp: int, rows_out: int, width: int, dtype, cid: int, name: str, chained: bool
 ):
@@ -226,24 +311,7 @@ def _send(
                 fr, to, n, peer = (tab_ref[c, i, j] for j in range(4))
 
                 def chunk(k, cc):
-                    src = src_hbm.at[pl.ds(pl.multiple_of(fr + k * SEG, SEG), SEG)]
-                    dst = out_hbm.at[pl.ds(pl.multiple_of(to + k * SEG, SEG), SEG)]
-
-                    @pl.when(peer == me)
-                    def _():
-                        pltpu.make_async_copy(src, dst, recv).start()
-
-                    @pl.when(peer != me)
-                    def _():
-                        pltpu.make_async_remote_copy(
-                            src_ref=src,
-                            dst_ref=dst,
-                            send_sem=sent,
-                            recv_sem=recv,
-                            device_id=(peer,),
-                            device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
-
+                    seg_copy(src_hbm, out_hbm, fr, to, k, peer, me, recv, sent)
                     return cc
 
                 return jax.lax.fori_loop(0, n, chunk, carry)
@@ -278,13 +346,8 @@ def _wait(name: str):
         m = len(sems)
 
         def kernel(cnt_ref, out_hbm, *refs):
-            tmpl = out_hbm.at[pl.ds(0, SEG)]
             for i in range(m):
-                # DMA semaphores count bytes: wait one SEG-row chunk at a time
-                cp = pltpu.make_async_copy(tmpl, tmpl, refs[i])
-                jax.lax.fori_loop(
-                    0, cnt_ref[i], lambda _, x, cp=cp: (cp.wait(), x)[1], 0
-                )
+                wait_chunks(out_hbm, refs[i], cnt_ref[i])
 
         return pl.pallas_call(
             kernel,
@@ -336,3 +399,63 @@ def exchange(tp: int, cap: int, padded_send_rows: int, he: int) -> Exchange:
         combine(True),
         _wait("sp_moe_wait"),
     )
+
+
+# ===== decode megakernel (decode/spep) =====
+
+
+def mk_exchange_counts(c: MKConfig, S: dict, me) -> None:
+    """ep_cnt_v[s] = rank s's slots per expert, on every rank."""
+    src = S["ep_csend"].at[pl.ds(0, 1)]
+    dst = S["ep_cnt_v"].at[pl.ds(me, 1)]
+    recv, sent = S["ep_cnt_sems"].at[0], S["ep_cnt_sems"].at[1]
+    pltpu.make_async_copy(src, dst, recv).start()
+    for d in range(1, c.tp):
+        peer = (me + d) % c.tp
+        pltpu.make_async_remote_copy(
+            src_ref=src, dst_ref=dst, send_sem=sent, recv_sem=recv, device_id=(peer,)
+        ).start()
+    tmpl = pltpu.make_async_copy(src, dst, recv)
+    for _ in range(c.tp):
+        tmpl.wait()
+    sent_tmpl = pltpu.make_async_copy(src, dst, sent)
+    for _ in range(c.tp - 1):
+        sent_tmpl.wait()
+
+
+def mk_dispatch(c: MKConfig, S: dict, me) -> None:
+    """This rank's send segment for each destination d (ep_xs) into d's receive buffer
+    (ep_xr) after the sources before this rank."""
+    from sglang_tpu.muse_megakernel.decode.spep.route import T_DST, T_SEND, seg_dmas
+
+    tab = S["ep_tab_s"]
+    recv, sent = S["ep_a2a_sems"].at[0], S["ep_a2a_sems"].at[1]
+    for d in range(c.tp):
+        s0, d0 = tab[T_SEND, d], tab[T_DST, d]
+
+        def one(i, carry, s0=s0, d0=d0, d=d):
+            seg_copy(S["ep_xs"], S["ep_xr"], s0, d0, i, d, me, recv, sent)
+            return carry
+
+        jax.lax.fori_loop(0, seg_dmas(S, me, d), one, 0)
+
+
+def mk_wait_dispatch(c: MKConfig, S: dict, me) -> None:
+    """Waits for every source's segment into ep_xr and this rank's sends out of ep_xs."""
+    from sglang_tpu.muse_megakernel.decode.spep.route import T_DMAS, seg_dmas
+
+    tab = S["ep_tab_s"]
+    wait_chunks(S["ep_xr"], S["ep_a2a_sems"].at[0], tab[T_DMAS, 0])
+    wait_chunks(
+        S["ep_xs"], S["ep_a2a_sems"].at[1], tab[T_DMAS, 1] - seg_dmas(S, me, me)
+    )
+
+
+def mk_wait_give_back(c: MKConfig, S: dict, me) -> None:
+    """Waits for the y rows of this rank's slots on other ranks into ep_yb (the expert loop
+    returns each item's rows to their sources, own ones locally)."""
+    from sglang_tpu.muse_megakernel.decode.spep.route import T_N
+
+    tab = S["ep_tab_s"]
+    n = sum(tab[T_N + me, d] for d in range(c.tp)) - tab[T_N + me, me]
+    wait_chunks(S["ep_yb"], S["ep_a2a_sems"].at[2], n, rows=1)

@@ -3,19 +3,17 @@
 
 import jax.numpy as jnp
 
-from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
-from sglang_tpu.muse_megakernel.common.numerics import _rms
-from sglang_tpu.muse_megakernel.common.plan import expert_units, n_expert_refs
-from sglang_tpu.muse_megakernel.prefill.tp.attn_out import attn_out_call
-from sglang_tpu.muse_megakernel.prefill.tp.config import (
+from sglang_tpu.muse_megakernel.common.config import (
     ATTN_OUT_TILE,
     POST_MOE_TILE,
     PFConfig,
 )
-from sglang_tpu.muse_megakernel.prefill.tp.post_moe import (
-    attention_inputs,
-    post_moe_call,
-)
+from sglang_tpu.muse_megakernel.common.consts import LANE, SMALL
+from sglang_tpu.muse_megakernel.common.numerics import _rms
+from sglang_tpu.muse_megakernel.common.plan import expert_units, n_expert_refs
+from sglang_tpu.muse_megakernel.common.qkv import attention_inputs
+from sglang_tpu.muse_megakernel.prefill.tp.attn_out import attn_out_call
+from sglang_tpu.muse_megakernel.prefill.tp.post_moe import post_moe_call
 
 # Leading operands before the weights: meta, pos, kv_lens, cu_q, dist, pf, psw, emb.
 N_STEP_ARGS = 8
