@@ -20,7 +20,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang_tpu.expert_loading import _wait_for
 from sglang_tpu.fp8_moe import (
     _clear_replaced_param,
-    _free_replaced_storage,
     _own_storage,
 )
 from sglang_tpu.fused_rs_sequence_parallel import (
@@ -306,8 +305,6 @@ def prepare_tpu_nvfp4_moe_weights(
     old_w13_scale = layer.w13_weight_scale.data
     copy_or_rebind_param(layer, "w13_weight", w13_w)
     copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
-    _free_replaced_storage(old_w13, layer.w13_weight.data)
-    _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
     del old_w13, old_w13_scale, w13_w, w13_scale
 
     # W2: pad packed-K and scale blocks to match, then transpose so N = hidden.
@@ -333,8 +330,6 @@ def prepare_tpu_nvfp4_moe_weights(
     old_w2_scale = layer.w2_weight_scale.data
     copy_or_rebind_param(layer, "w2_weight", w2_w)
     copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
-    _free_replaced_storage(old_w2, layer.w2_weight.data)
-    _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
     del old_w2, old_w2_scale, w2_w, w2_scale
 
     for name in _UNUSED_NVFP4_MOE_PARAMS:

@@ -24,18 +24,11 @@ from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.fp8_moe import _own_storage
 
 
-def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
-    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
-        old.untyped_storage().resize_(0)
-
-
 def _drop_param(layer: torch.nn.Module, name: str) -> None:
     """Release a load-time-only parameter (g_idx bookkeeping etc.)."""
     param = getattr(layer, name, None)
     if isinstance(param, Parameter):
-        old = param.data
-        param.data = torch.empty(0, dtype=old.dtype, device=old.device)
-        _free_replaced_storage(old, param.data)
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
     setattr(layer, name, None)
 
 
@@ -79,7 +72,7 @@ def prepare_tpu_vmem_fp8_scales(layer: torch.nn.Module, group_size: int) -> None
             channel_name,
             Parameter(channels.to(old_scale.device), requires_grad=False),
         )
-        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
+        del old_scale
     layer.is_tpu_vmem_fp8 = True
 
 
@@ -140,7 +133,7 @@ def prepare_tpu_w4a16_moe_weights(layer: torch.nn.Module, group_size: int) -> No
             f"{scale_name} blocks {num_blocks}*group_size {group_size}"
         )
         copy_or_rebind_param(layer, scale_name, new_scale)
-        _free_replaced_storage(old_scale, getattr(layer, scale_name).data)
+        del old_scale
 
     # Load-time-only bookkeeping params (no actorder on this path).
     for name in (

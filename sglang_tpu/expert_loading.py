@@ -258,11 +258,8 @@ def _replace_with_expert_chunks(
 ) -> None:
     """Free the parameter's data, then set it to the chunks joined along the
     expert axis; the chunks must not share storage with the freed data."""
-    from sglang_tpu.fp8_moe import _free_replaced_storage
-
-    old = param.data
-    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
-    _free_replaced_storage(old, param.data)
+    # no reference to the old data survives, so it is freed before the cat allocates
+    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
     param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
     chunks.clear()
     _wait_for(param.data)

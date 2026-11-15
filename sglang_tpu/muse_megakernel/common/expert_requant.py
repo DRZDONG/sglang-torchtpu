@@ -15,7 +15,6 @@ from sglang_tpu.fp4_moe import (
     mark_qblock_layout,
     qblock_layout,
 )
-from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.moe.nvfp4_requant import (
     NVFP4_SERVED_GROUP,
     QBLOCK_SIZES,
@@ -94,12 +93,5 @@ def requant_tpu_nvfp4_experts(layer: torch.nn.Module, block: int) -> None:
     copy_or_rebind_param(layer, "w2_weight", w2)
     copy_or_rebind_param(layer, "w2_weight_scale", s2)
     del w2, s2
-    new = (
-        layer.w13_weight.data,
-        layer.w13_weight_scale.data,
-        layer.w2_weight.data,
-        layer.w2_weight_scale.data,
-    )
-    for o, n in zip(old, new):
-        _free_replaced_storage(o, n)
+    del old
     mark_qblock_layout(layer, block)

@@ -58,7 +58,6 @@ from sglang.srt.runtime_context import get_parallel, process_model_config
 from sglang.srt.utils import add_prefix, make_pp_layers
 from sglang_tpu.envs import envs as tpu_envs
 from sglang_tpu.expert_loading import _wait_for
-from sglang_tpu.fp8_moe import _free_replaced_storage
 from sglang_tpu.fp8_moe_fused_rs import apply_fp8_fused_rs, prepare_fp8_fused_rs
 
 logger = logging.getLogger(__name__)
@@ -366,7 +365,7 @@ class _HostQuantizedFp8MoEMethod(Fp8MoEMethod):
                 device=layer.w13_weight.device,
             ),
         )
-        _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
+        del old_w13_scale
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -1036,9 +1035,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
                 f"checkpoint slice {tuple(local.shape)}"
             )
         device, dtype = param.device, param.dtype
-        old = param.data
         param.data = torch.empty(0, dtype=dtype, device=device)
-        _free_replaced_storage(old, param.data)
 
         per_expert_bytes = max(
             1, local[0].numel() * max(param.element_size(), local.element_size())
@@ -1072,9 +1069,7 @@ class MuseSparkForConditionalGeneration(nn.Module):
             del chunks
             scale_name = f"{name}_scale"
             scale_param = params[scale_name]
-            old_scale = scale_param.data
             scale_param.data = torch.empty(0, dtype=scale_param.dtype, device=device)
-            _free_replaced_storage(old_scale, scale_param.data)
             scale_param.data = torch.cat(scale_chunks, dim=0).to(
                 device=device, dtype=scale_param.dtype, copy=True
             )

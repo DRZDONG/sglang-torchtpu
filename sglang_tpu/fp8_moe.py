@@ -26,29 +26,23 @@ from sglang.srt.utils import print_warning_once
 from sglang_tpu.envs import envs
 
 
-def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
-    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
-        old.untyped_storage().resize_(0)
-
-
 def _clear_replaced_param(module: torch.nn.Module, name: str) -> None:
     param = getattr(module, name, None)
     if not isinstance(param, Parameter):
         setattr(module, name, None)
         return
 
-    old = param.data
-    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
-    _free_replaced_storage(old, param.data)
+    # dropping the last reference frees the buffer; untyped_storage().resize_(0) left the
+    # TPU runtime faulting (UserFatalError) at process teardown
+    param.data = torch.empty(0, dtype=param.dtype, device=param.device)
     setattr(module, name, None)
 
 
 def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None:
     device = param.data.device
     dtype = param.data.dtype
-    old = param.data
+    # the old buffer goes before the new one is allocated (no reference kept)
     param.data = torch.empty(0, dtype=dtype, device=device)
-    _free_replaced_storage(old, param.data)
     param.data = new_cpu.to(device=device, dtype=dtype)
 
 
@@ -424,9 +418,7 @@ def _prepare_tpu_dsv4_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
 
     # Release original device buffers before allocating converted tensors on device.
     for param in (w13_param, w2_param):
-        old = param.data
-        param.data = torch.empty(0, dtype=old.dtype, device=old.device)
-        _free_replaced_storage(old, param.data)
+        param.data = torch.empty(0, dtype=param.dtype, device=param.device)
     _clear_replaced_param(layer, "w13_weight_scale_inv")
     _clear_replaced_param(layer, "w2_weight_scale_inv")
 
@@ -509,8 +501,7 @@ def prepare_tpu_fp8_moe_weights(
         )
         copy_or_rebind_param(layer, "w13_weight_scale_inv", w13_scale)
         copy_or_rebind_param(layer, "w2_weight_scale_inv", w2_scale)
-        _free_replaced_storage(old_w13_scale, layer.w13_weight_scale_inv.data)
-        _free_replaced_storage(old_w2_scale, layer.w2_weight_scale_inv.data)
+        del old_w13_scale, old_w2_scale
     else:
         old_w13_scale = layer.w13_weight_scale.data
         old_w2_scale = layer.w2_weight_scale.data
@@ -520,8 +511,7 @@ def prepare_tpu_fp8_moe_weights(
         w2_scale = _to_tpu_fp8_moe_scale_layout(old_w2_scale, layer.w2_weight.shape[-1])
         copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
         copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
-        _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
-        _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
+        del old_w13_scale, old_w2_scale
 
     # No per-layer drain here: the requantize loop above already syncs per
     # expert-chunk (bounding the float32 dequant transient), and the loader
