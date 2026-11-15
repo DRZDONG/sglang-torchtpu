@@ -28,9 +28,11 @@ from sglang_tpu.muse_megakernel.common.consts import (
     SP_DISPATCH_COLLECTIVE_ID,
 )
 
-# rows per DMA and segment alignment: DMA offsets must be HBM-tile aligned (8 rows of u32 /
-# bf16), and gmm_v2 faults (TPU UserFatalError) on bf16 groups starting off a 16-row tile
-SEG = 16
+# rows per DMA and segment alignment: DMA offsets must be HBM-tile aligned (8 rows of u32 / bf16)
+SEG = 8
+# each expert's group starts on this row in the receive buffer: gmm_v2 faults (TPU
+# UserFatalError) on bf16 groups starting off a 16-row tile; the gap rows are never sent
+GROUP_ALIGN = 16
 UNPACK_ROWS = 256  # unpack_rows block
 
 _HBM = pl.BlockSpec(memory_space=pltpu.HBM)
@@ -65,7 +67,8 @@ def plan(cnt_all, me, tp: int, el: int, n_chunks: int) -> A2APlan:
     g, ec = tp * el, el // n_chunks
     pc = _pad(cnt_all)  # [s, g]
     pc3 = pc.reshape(tp, tp, el)  # [s, d, e]
-    tot = pc3.sum(0)  # [d, e]
+    # [d, e] receiver rows per expert, GROUP_ALIGN-padded
+    tot = (pc3.sum(0) + GROUP_ALIGN - 1) // GROUP_ALIGN * GROUP_ALIGN
     # receiver d: expert-major, then source
     dst_off = _exclusive_cumsum(tot, axis=1)[None] + _exclusive_cumsum(pc3, axis=0)
     pad_src = _exclusive_cumsum(pc, axis=1).reshape(

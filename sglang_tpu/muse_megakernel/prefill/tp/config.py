@@ -47,6 +47,8 @@ class PFConfig(msgspec.Struct, frozen=True, kw_only=True):
     sp: bool = False
     # per layer "fp4" / "fp8": the SP program's expert dot kinds
     expert_kinds: tuple = ()
+    # SGLANG_TPU_MUSE_MK_PREFILL_SP_DEBUG_HP: SP dense activations in f32 (numerics A/B)
+    sp_debug_hp: bool = False
 
     @property
     def q_dim(self) -> int:

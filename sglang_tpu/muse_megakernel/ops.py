@@ -891,6 +891,7 @@ class MuseMegakernel(torch.nn.Module):
             w4a16_layers=self.w4a16_layers,
             sp=sp,
             expert_kinds=tuple(self.kinds) if sp else (),
+            sp_debug_hp=sp and tpu_envs.SGLANG_TPU_MUSE_MK_PREFILL_SP_DEBUG_HP.get(),
         ).validate()
 
     def prefill_callable_for(self, cfg: PF.PFConfig):

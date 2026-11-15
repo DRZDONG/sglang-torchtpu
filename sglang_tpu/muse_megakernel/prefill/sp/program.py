@@ -4,20 +4,22 @@
 Between layers rank m owns rows [m * Ts, (m + 1) * Ts) of the chunk (Ts = rows / tp). Per layer:
 
     own rows --AG (e4m3 + row scale)--> attention on every row with this rank's heads
-      -> o proj partial of every row --RS by row (bf16)--> attention residual on own rows
+      -> gated output of every row --a2a by row (e4m3 + row scale)--> own rows, every head
+      -> o proj on own rows (replicated wo) and the attention residual
       -> router and replicated pool on own rows
-      -> each (row, slot) --ragged a2a (e4m3 + row scale)--> its expert's rank (E / tp whole
-         experts per rank) -> grouped whole-expert FFN --ragged a2a (bf16)--> the row owner
+      -> each (row, slot) --remote-DMA a2a (a2a.py: e4m3 + row scale, expert-grouped)--> its
+         expert's rank (E / tp whole experts) -> grouped whole-expert FFN, streamed per expert
+         chunk --remote-DMA a2a (bf16)--> the row owner
       -> post-expert norm, weighted sum, replicated unpool and FFN residual on own rows
 
 Dtypes: e4m3 activations (a row scale each) into every dense dot, the experts and the q of
-attention; f32 at the norms and the residual; bf16 only for the sums that feed a norm (the o
-RS, the expert outputs, the unpool output).
+attention; f32 at the norms and the residual; bf16 only for sums that feed a norm (the
+expert outputs, the unpool output).
 
-Weights: wqkvg / wo are this rank's head slices; wpool / wunpool are replicated ([H, He] /
-[He, H], scales over every column); a layer's experts are this rank's whole experts as
-(w13, s13, w2, s2): u32 words [E/tp, K / pack, N] of e2m1 (8) or e4m3 (4) codes along K in
-natural order, scales [E/tp, K / block, 1, N]. The collectives are XLA's.
+Weights: wqkvg is this rank's head slice; wo / wpool / wunpool are replicated ([qd * tp, H] /
+[H, He] / [He, H], scales over every column); a layer's experts are this rank's whole experts
+as (w13, s13, w2, s2): u32 words [E/tp, K / pack, N] of e2m1 (8) or e4m3 (4) codes along K in
+natural order (w13's columns: all gate, then all up), scales [E/tp, K / block, 1, N].
 """
 
 import jax
@@ -34,10 +36,12 @@ _F32, _BF16, _FP8 = (
     jnp.dtype(t) for t in (jnp.float32, jnp.bfloat16, jnp.float8_e4m3fn)
 )
 _FP8_MAX = 448.0
-# w13's columns come in EXPERT_TILE_N-wide gate / up pairs ([g0 | u0 | g1 | u1 | ...]), the
-# layout gmm_v2's fused silu reads per output tile
-EXPERT_TILE_N = 1024
-# local-expert chunks of the streamed MoE all-to-alls
+# expert gmm tiles, swept on v7x (32 whole experts, ~5k rows; tile_m 128 re-read each expert's
+# weights per 128 rows): 256 / 4096 / 2048 ran 0.81 ms fp8, 0.96 ms fp4 vs 1.9 ms at 128 / 1024 /
+# 1024; 2048 / 4096 overflows VMEM on fp8. w13's columns are [all gate | all up] (fused silu)
+EXPERT_TILES = (256, 4096, 2048)
+# local-expert chunks of the streamed MoE all-to-alls; 8 measured slower on v7x 4096 rows
+# (smaller gmm calls, more unpack block overlap outweigh the shorter exposed wait)
 N_CHUNKS = 4
 
 
@@ -85,11 +89,26 @@ def build_forward(c: PFConfig, axis: str = "model"):
     # every (source, expert) segment padded to a2a.SEG rows on both sides
     Pp = P + G * (a2a.SEG - 1)  # padded send rows
     # receive rows: every rank's every slot, padded (whole unpack blocks)
-    cap = -(-(T * K + G * (a2a.SEG - 1)) // a2a.UNPACK_ROWS) * a2a.UNPACK_ROWS
+    cap = T * K + G * (a2a.SEG - 1) + El * (a2a.GROUP_ALIGN - 1)
+    cap = -(-cap // a2a.UNPACK_ROWS) * a2a.UNPACK_ROWS
     xchg = a2a.exchange(tp, cap, Pp, He)
 
     def ag(x):
         return jax.lax.all_gather(x, axis, axis=0, tiled=True)
+
+    def to_owner(x):
+        """[T, d] (this rank's heads of every row) -> [Ts, tp, d]: own rows, every rank's
+        heads in rank order. e4m3 travels as bytes."""
+        b = jax.lax.bitcast_convert_type(x, jnp.uint8) if x.dtype == _FP8 else x
+        b = jax.lax.all_to_all(b, axis, 0, 0, tiled=True).reshape(tp, Ts, -1)
+        b = b.transpose(1, 0, 2)
+        return jax.lax.bitcast_convert_type(b, _FP8) if x.dtype == _FP8 else b
+
+    def rows8(x):
+        """_fp8_rows, or (x, 1) with sp_debug_hp."""
+        if c.sp_debug_hp:
+            return x.astype(_F32), jnp.ones((x.shape[0], 1), _F32)
+        return _fp8_rows(x)
 
     def dense(x8, xs, w, sm, name: str, n: int):
         """e4m3 rows (row scales xs) @ an e4m3 K-major slab, times its per-output-channel
@@ -150,11 +169,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
                 rhs_quant_dtype=q_dtype,
                 maybe_quantize_lhs=True,
                 fuse_act=fuse_act,
-                # the default picks tk = K, tn = N: [4096, 8192] tiles overflow VMEM
-                tile_info=TileSizes(tile_m=128, tile_k=1024, tile_n=EXPERT_TILE_N),
+                tile_info=TileSizes(*EXPERT_TILES),
             )
 
-        # silu(gate) * up in the w13 kernel's epilogue (EXPERT_TILE_N-paired columns)
+        # silu(gate) * up in the w13 kernel's epilogue
         return gmm(gmm(x, w13, s13, fuse_act="silu"), w2, s2)
 
     def moe(l, me, xe8, xs, ids, experts):
@@ -245,26 +263,26 @@ def build_forward(c: PFConfig, axis: str = "model"):
         aux = []
         for l in range(L):
             sm = smalls[l]
-            a8, a_s = _fp8_rows(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
+            a8, a_s = rows8(_rms(stream, c.rms_eps) * small_row(sm, "pre_attn_w"))
             qkvg = dense(ag(a8), ag(a_s), wqkvg[l], sm, "wqkvg", c.qkvg_dim)
             q, kvs, gate = qkv_from_proj(c, qkvg, rope_rows if c.use_rope(l) else None)
             o, kv[l] = attention(l, q, kvs, kv[l], kv_lens, pf, psw, cu_q, dist)
             attn = _heads_rms(o.reshape(T, qd), c.q_heads, hd, c.rms_eps)
-            g8, g_s = _fp8_rows(jax.nn.sigmoid(gate.astype(_F32)) * attn)
-            o_part = dense(g8, g_s, wo[l], sm, "wo", H).astype(_BF16)
-            # bf16 on the wire: the sum feeds the post-attention norm
-            a = jax.lax.psum_scatter(o_part, axis, scatter_dimension=0, tiled=True)
-            stream = residual(stream, sm, "attn", a.astype(_F32))
+            g8, g_s = rows8(jax.nn.sigmoid(gate.astype(_F32)) * attn)
+            # own rows' every head, then the o-proj locally on the whole wo: no partial sums
+            g = (to_owner(g8).astype(_F32) * to_owner(g_s)).reshape(Ts, tp * qd)
+            g8, g_s = rows8(g)
+            stream = residual(stream, sm, "attn", dense(g8, g_s, wo[l], sm, "wo", H))
 
             ffn = _rms(stream, c.rms_eps) * small_row(sm, "pre_ffn_w")
             # router input stays bf16 until the GSM8K A/B settles its dtype
             ids, tw = route(ffn.astype(_BF16), wrouter[l], sm)
-            f8, f_s = _fp8_rows(ffn)
+            f8, f_s = rows8(ffn)
             pooled = dense(f8, f_s, wpool[l], sm, "wpool", He)
             xe8, xs = _fp8_rows(
                 _rms(pooled, c.rms_eps) * small_row(sm, "pre_expert_w")[:, :He]
             )
-            u8, u_s = _fp8_rows(combine(moe(l, me, xe8, xs, ids, experts), tw, sm))
+            u8, u_s = rows8(combine(moe(l, me, xe8, xs, ids, experts), tw, sm))
             # bf16: the unpool output feeds the post-FFN norm
             f = dense(u8, u_s, wunpool[l], sm, "wunpool", H).astype(_BF16)
             stream = residual(

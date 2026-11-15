@@ -582,6 +582,9 @@ class TpuEnvs:
     # Prefill program in the sequence-parallel layout (prefill/sp): each rank owns rows / tp of
     # the chunk between layers, instead of every rank holding every row (prefill/tp).
     SGLANG_TPU_MUSE_MK_PREFILL_SP = EnvBool(False)
+    # Debug (numerics A/B): the SP program's dense activations (a_in, gated attention, ffn, u)
+    # stay f32 instead of e4m3 rows; dispatch stays e4m3 (the expert gmm requantizes anyway).
+    SGLANG_TPU_MUSE_MK_PREFILL_SP_DEBUG_HP = EnvBool(False)
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)

@@ -130,36 +130,32 @@ def _fp8_serving_refs(l: int, rank: int, device: torch.device) -> list:
 
 def _sp_expert_refs(l: int, rank: int, kind: str, device: torch.device) -> list:
     """This rank's E / tp whole experts as the SP program reads them: every rank's slices
-    side by side (w13: gate and up in EXPERT_TILE_N pairs; w2's rows), u32 codes along K,
-    scales [E / tp, K / block, 1, N] (fp4: SGLANG_TPU_MUSE_MK_QBLOCK blocks; fp8: w13 per
-    column, w2 per column of each rank's INTER_LOCAL rows)."""
-    from sglang_tpu.muse_megakernel.prefill.sp.program import EXPERT_TILE_N
-
+    side by side (w13: all gate columns, then all up columns, the halves gmm_v2's fused silu
+    reads; w2's rows), u32 codes along K, scales [E / tp, K / block, 1, N] (fp4:
+    SGLANG_TPU_MUSE_MK_QBLOCK blocks; fp8: w13 per column, w2 per column of each rank's
+    INTER_LOCAL rows)."""
     il = M.INTER_LOCAL
     el = M.N_EXPERTS // TP
 
-    def paired(gate, up):
-        """[rows, I] gate and up -> [rows, 2I] in EXPERT_TILE_N-wide [g0 | u0 | g1 | ...]."""
-        t, rows = EXPERT_TILE_N, gate.shape[0]
-        g, u = gate.reshape(rows, -1, t), up.reshape(rows, -1, t)
-        return torch.stack([g, u], dim=2).reshape(rows, -1)
+    def halves(gate, up):
+        return torch.cat([gate, up], dim=1)
 
     out = [[], [], [], []]
     for e in range(rank * el, (rank + 1) * el):
         sl = [M.tp_expert_slabs(l, d, e, kind) for d in range(TP)]
-        w13 = paired(
+        w13 = halves(
             torch.cat([s[0][:, :il] for s in sl], dim=1),
             torch.cat([s[0][:, il:] for s in sl], dim=1),
         )
         w2 = torch.cat([s[2] for s in sl], dim=0)
         if kind == "fp4":
-            s13 = paired(
+            s13 = halves(
                 torch.cat([s[1][:, :il] for s in sl], dim=1),
                 torch.cat([s[1][:, il:] for s in sl], dim=1),
             )
             s2 = torch.cat([s[3] for s in sl], dim=0)
         else:
-            s13 = paired(
+            s13 = halves(
                 torch.cat([s[1][0, :il] for s in sl])[None],
                 torch.cat([s[1][0, il:] for s in sl])[None],
             )
@@ -170,7 +166,7 @@ def _sp_expert_refs(l: int, rank: int, kind: str, device: torch.device) -> list:
 
 
 def _sp_replicate_pool(runner, n_layers: int) -> None:
-    """wpool / wunpool replicated: every rank's columns side by side, their scales too."""
+    """wpool / wunpool / wo replicated: every rank's slices side by side, their scales too."""
     K = runner.K
     names = list(K.WEIGHT_NAMES)
     sm = runner.weights[names.index("smalls")].cpu()
@@ -183,6 +179,17 @@ def _sp_replicate_pool(runner, n_layers: int) -> None:
             sm[l, K.SMALL[name + "_s"]] = 0
             sm[l, K.SMALL[name + "_s"], : sc.numel()] = sc
         runner.weights[names.index(name)] = torch.stack(full).to(runner.device)
+    # wo whole (the SP o-proj runs locally on every head): every rank's rows stacked, requantized
+    # to one per-output-channel scale (each rank's slice had its own)
+    full = []
+    for l in range(n_layers):
+        ranks = [M.dense_layer(l, d) for d in range(TP)]
+        w = torch.cat([r["wo"].float() * r["wo_s"][None] for r in ranks])
+        sc = w.abs().amax(0).clamp_min(1e-30) / 448.0
+        full.append((w / sc).to(torch.float8_e4m3fn))
+        sm[l, K.SMALL["wo_s"]] = 0
+        sm[l, K.SMALL["wo_s"], : sc.numel()] = sc
+    runner.weights[names.index("wo")] = torch.stack(full).to(runner.device)
     runner.weights[names.index("smalls")] = sm.to(runner.device)
 
 
@@ -438,6 +445,7 @@ class _PrefillRunner:
         max_position: int,
         sp: bool = False,
         with_ref: bool = True,
+        capture: tuple | None = None,
     ):
         from sglang_tpu.muse_megakernel import ops
         from sglang_tpu.muse_megakernel.decode.tp import kernel as K
@@ -445,6 +453,8 @@ class _PrefillRunner:
         self.ops = ops
         self.base = M._Runner(K, ops, n_layers, global_layers, rank, max_position)
         self.sp = sp
+        # aux layers the step returns (numerics checks every layer; all by default)
+        self.capture = list(range(n_layers)) if capture is None else list(capture)
         # built before SP replaces the pool / unpool weights: it reads every rank's slices
         self.ref = _DeviceRef(self.base, n_layers) if with_ref else None
         for l, kind in enumerate(self.base.kinds):
@@ -487,7 +497,7 @@ class _PrefillRunner:
         kv_lens = torch.tensor([c + case.q for c in case.ctx], dtype=torch.int32)
         cu_q = torch.arange(n + 1, dtype=torch.int32) * case.q
         dist_ = torch.tensor([n, n, n], dtype=torch.int32)
-        capture = list(range(self.base.n_layers))
+        capture = self.capture
         op = torch.ops.sglang_tpu_pallas.muse_prefill
 
         def run(meta, pos, kv_lens, cu_q, dist_, pf, psw, emb, weights, experts, kv):
@@ -680,7 +690,13 @@ def main() -> None:
     ap.add_argument("--bench-iters", type=int, default=0)
     # with --bench-iters: an xprof capture of 3 more steps per case (rank 0) under this dir
     ap.add_argument("--profile-dir", default="")
+    # with --bench-iters: aux layers to return, comma-separated (empty: none); default all
+    ap.add_argument("--capture", default=None)
+    # debug: build the runner (weights, pools) and exit before any prefill step
+    ap.add_argument("--setup-only", action="store_true")
     args = ap.parse_args()
+    if args.capture is not None and not args.bench_iters:
+        raise ValueError("--capture is for --bench-iters; numerics checks every layer")
     if args.sp:
         os.environ["SGLANG_TPU_MUSE_MK_PREFILL_SP"] = "1"
     if M.tp_qblock() != 256:
@@ -715,10 +731,15 @@ def main() -> None:
         max_position,
         sp=args.sp,
         with_ref=not args.bench_iters,
+        capture=None
+        if args.capture is None
+        else tuple(int(x) for x in args.capture.split(",") if x),
     )
     if rank == 0:
         print(f"MK_PREFILL_NUMERICS_SETUP weights {time.time() - t0:.1f}s", flush=True)
     dist.barrier()
+    if args.setup_only:
+        return
     if args.bench_iters:
         for case in cases:
             st = step_inputs(case)
