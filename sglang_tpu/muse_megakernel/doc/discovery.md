@@ -50,5 +50,18 @@ Each entry is a finding: what it is, the evidence (anvil sweep ids, all on the 2
   - **tm=128: 163.6 ms** (trace + LLO `20261116-045918-99de`). Per step, the MXU work and the partial pops halve (vmatmul 1012 -> 490, vpop 5521 -> 2944), but the fp4 unpack does not (1825 -> 1667): every step unpacks a whole 4096 x 2048 weight tile whatever tm is. With about 128 rows per expert plus the 16-row alignment offset, most experts take two steps, and the second step unpacks the same weights again (they are not re-DMA'd). The result is 1.72x the steps at 0.60x the bundles: +4% per call.
   - **tm=512 / tn=1024: 200.7 ms.** Rows per expert are about 128, so tm=512 pads 3/4 of the MXU work, and tn=1024 doubles the n-steps, each of which re-reads and re-quantizes the lhs.
   - **2 or 8 MoE chunks instead of 4: 164.4 / 166.2 ms.** Two chunks hide less of the a2a behind the expert FFN. Eight chunks make smaller gmm calls with more fixed cost per call, and more unpack-block overlap. These two causes are inferred, not yet traced.
-- **Fix in progress: requantize to e4m3 in VMEM with per-channel scales, and one lhs scale per row.** The MXU then accumulates the whole K in one partial: about 1.5k rescale ops per step instead of about 20k, plus about 12k requant ops. The LLO-based estimate is w13 134 -> 80-85 us and w2 about halved, a chunk about 158 -> 133-139 ms. It needs `gmm_v2`'s `lhs_quant_block_size` (a local, uncommitted, default-unchanged kwarg) and a numerics check: each weight takes one more e4m3 rounding, and blocks far below their column's max scale fall into subnormals. Knob `SGLANG_TPU_MUSE_MK_PF_SP_REQUANT`. The first compile OOMed the anvil compiler; retry `20261116-050753-9026`.
+- **Requantizing to e4m3 in VMEM: -24% per gmm, at +1 point of error. Not adopted yet.** Measured on a debug box with `.claude_scratch/gmm_requant_test.py`: 8 experts x 128 rows, K 4096, N 8192 (w13), fp4 with block-256 scales.
+
+  | gmm_v2 config | us/call | rms error vs f32 |
+  |---|---|---|
+  | today, 256/4096/2048 | 143 | 2.73% |
+  | requant 256/4096/2048, lhs scale per row | 109 | 3.64% |
+  | requant 256/1024/2048, lhs block 1024 | 170 | 3.65% |
+  | requant 256/512/512, lhs block 512 | 769 | 3.65% |
+
+  - Only big tiles pay, since every step requantizes its weight tile. The LLO estimate was 80-85 us; the measurement is 109.
+  - The extra error comes from the weights, not from the lhs block size (3.64-3.65% for lhs blocks 512 to 4096). fp4 code x (group / channel scale) is an arbitrary ratio, and rounding it to e4m3's 3 mantissa bits costs about 2^-4 / sqrt(3), which is 3.6% per element, matching the measurement.
+  - Per chunk it would save about 12 ms of 158.
+  - It needs two `gmm_v2` changes, both local and uncommitted: a static `lhs_quant_block_size` kwarg (it must be in `static_argnames`; leaving it out raised TracerBoolConversionError, which the anvil compilers had reported as an OOM), and the requant guard opened from INT4 / group 32 to fp4 / block 256.
+  - Adopting it needs an end-to-end quality check (GSM8K).
 - **`fp8_gather` and W4A16 do not apply to SP + EP.** `SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER` sends the TP prefill's xe / u all-gathers in e4m3, and `prefill/spep/program.py` raises if it is set. `w4a16_layers` routes TP prefill's fp4 layers to the fused-RS W4A16 kernel; SP + EP always runs `gmm_v2`. The TP8 reference in the prefill chart comes from 2026-11-10 serving with both on, not from anvil.
