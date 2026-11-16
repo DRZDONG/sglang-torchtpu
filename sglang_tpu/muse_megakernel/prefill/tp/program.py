@@ -35,8 +35,10 @@ def build_forward(c: PFConfig, axis: str = "model"):
     """(meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights in kernel.WEIGHT_NAMES order,
     *experts, *kv) -> (hidden, aux, *kv). meta is [live rows, TP rank]; smalls rows hold the
     norms' gains (zero-centered weights + 1), as for the decode megakernel."""
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
+    from sglang_tpu.attention.pallas.batched_rpa_prefill import configs
+    from sglang_tpu.attention.pallas.batched_rpa_prefill.wrapper import (
+        ragged_paged_attention,
+    )
     from sglang_tpu.moe.pallas.fused_rs.fused_moe import moe_gmm_local_rs_nodedup
 
     c.validate()

@@ -69,8 +69,10 @@ def _fp8_rows(x):
 def build_forward(c: PFConfig, axis: str = "model"):
     """prefill/tp's (meta, pos, kv_lens, cu_q, dist, pf, psw, emb, *weights, *experts, *kv) ->
     (hidden, aux, *kv), computed in the sequence-parallel layout with an EP MoE."""
-    from sglang_tpu.attention.pallas.batched_rpa import configs
-    from sglang_tpu.attention.pallas.batched_rpa.wrapper import ragged_paged_attention
+    from sglang_tpu.attention.pallas.batched_rpa_prefill import configs
+    from sglang_tpu.attention.pallas.batched_rpa_prefill.wrapper import (
+        ragged_paged_attention,
+    )
     from sglang_tpu.moe.pallas.gmm_v2 import TileSizes, gmm_v2
 
     c.validate()
@@ -137,7 +139,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
     def attention(l, q, kvs, kv_pool, kv_lens, pf, psw, cu_q, dist):
         is_global = l in c.global_layers
         return ragged_paged_attention(
-            q.astype(_FP8).reshape(T, c.q_heads, hd),
+            # bf16 q: the prefill RPA's transposed / ones-V tiles take no e4m3 q
+            q.astype(_BF16).reshape(T, c.q_heads, hd),
             kvs[:, :kvd].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
             kvs[:, kvd:].astype(jnp.float8_e4m3fn).reshape(T, c.kv_heads, hd),
             kv_pool,
@@ -147,12 +150,8 @@ def build_forward(c: PFConfig, axis: str = "model"):
             dist,
             sm_scale=c.attn_scale,
             sliding_window=None if is_global else c.window,
-            # no q_scale: the head-RMS'd q is already e4m3 at unit scale, and RPA's q
-            # rescale clips in the q dtype (an e4m3 max does not lower)
             k_scale=1.0,
             v_scale=1.0,
-            # an e4m3 q's output gets its own bf16 buffer (RpaServeConfigs.separate_out)
-            out_dtype=_BF16,
             kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         )
 

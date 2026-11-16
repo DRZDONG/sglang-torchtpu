@@ -600,6 +600,61 @@ class TpuEnvs:
     # Kernel-level weight layouts (anvil / numerics only); serving raises on them.
     SGLANG_TPU_MUSE_MK_KPERM = EnvBool(False)
     SGLANG_TPU_NVFP4_E4M3_SCALES = EnvBool(False)
+    # Batched RPA prefill tuning (P/D prefill kernels, from junyanxu/muse-prefill-pp8)
+    # "bq:bq_c:bkv:n_buffer": prefill blocks for every layer, skipping the VMEM search, whose
+    # estimate refuses tiles that fit at TP1 head counts (PP prefill); n_buffer >= 2.
+    SGLANG_TPU_FORCE_RPA_PREFILL_BLOCKS = EnvStr(None)
+    # Pin the RPA prefill q block / q compute chunk of full-attention layers (bq_c is
+    # reduced to a divisor of bq); unset uses calculate_block_sizes's power-of-2 search
+    # (e.g. bq=1024, bkv=1536 on Muse Spark global layers and 512:512 on window=2048).
+    SGLANG_TPU_FORCE_RPA_PREFILL_BQ = EnvInt(None)
+    SGLANG_TPU_FORCE_RPA_PREFILL_BQ_C = EnvInt(None)
+    SGLANG_TPU_RPA_CHUNK_VT = EnvBool(False)
+    # Batched RPA prefill softmax (the per-score vector chain, not the MXU, sets the
+    # time): exp2 with log2e folded into the q scale, one VALU op per score fewer.
+    # Off with an attention sink or an LSE output, which would see base-2 m and l;
+    # the folded scale rounds q in bf16, so the output is not bit-identical.
+    SGLANG_TPU_RPA_EXP2_SOFTMAX = EnvBool(False)
+    # Batched RPA (non-transposed tiles, e.g. verify blocks): softmax without the running
+    # row max. Only for bounded scores: Muse's weightless per-head RMS-normed q and k keep
+    # |s| <= ~44, so exp(s) fits; rounding differs from the max-subtracted form.
+    SGLANG_TPU_RPA_NO_MAX = EnvBool(False)
+    # Row sums from the PV matmul: V tiles get ones rows in the lanes head_dim 64
+    # leaves idle on the MXU, so the accumulator carries l and the vector row-sum
+    # reduce and the separate l rescale go away. SEQ_ALONG_LANE, head_dim <= 64.
+    SGLANG_TPU_RPA_ONES_V = EnvBool(False)
+    # Batched RPA outputs come per-head RMS-normalized (weightless, this eps), as Muse
+    # Spark's attention output norm; the model then skips its own. Muse only.
+    SGLANG_TPU_RPA_OUT_HEAD_NORM_EPS = EnvFloat(None)
+    # "bq:bkv": batched-RPA prefill q / k block sizes for full-attention layers and
+    # for sliding-window layers, instead of the VMEM search's; unset keeps the search.
+    SGLANG_TPU_RPA_PREFILL_BLOCKS = EnvStr(None)
+    # Batched RPA prefill: tiles whose keys all precede their queries skip the causal
+    # (and sliding-window) mask, and a power-of-two sm_scale is folded into q. Exact.
+    SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK = EnvBool(False)
+    # Transposed prefill tiles skip the compute blocks past the last query of a
+    # partial q block (a sequence's last) instead of scoring padded rows. Exact.
+    SGLANG_TPU_RPA_SKIP_PAD_Q = EnvBool(False)
+    # Query tokens per iteration of that skip's loop (fewer, longer iterations overlap better).
+    SGLANG_TPU_RPA_SKIP_PAD_Q_GROUP = EnvInt(128)
+    SGLANG_TPU_RPA_SWA_PREFILL_BLOCKS = EnvStr(None)
+    SGLANG_TPU_RPA_S_BF16 = EnvBool(False)
+    # Batched RPA: in-kernel trace regions (step body, full / masked tile), visible in
+    # xprof with libtpu's --xla_enable_custom_call_region_trace=true. Profiling only.
+    SGLANG_TPU_RPA_TRACE_REGIONS = EnvBool(False)
+    # Prefill attention tiles with transposed scores (keys along sublanes) and
+    # fp8 q; not bit-exact with the default tile. Mixed/prefill, SEQ_ALONG_LANE,
+    # head_dim <= 64, no sink / LSE / soft cap / cache-only / context parallel.
+    SGLANG_TPU_RPA_TRANSPOSED = EnvBool(False)
+    SGLANG_TPU_RPA_TRANSPOSED_FP8_P = EnvBool(False)
+    # Transposed tiles with SGLANG_TPU_RPA_NO_MAX run an unshifted streaming softmax
+    # (no running max, no alpha rescale) over key chunks of this many keys (the largest
+    # divisor of the k block up to it); unset streams the whole k block up to 1536 keys.
+    SGLANG_TPU_RPA_TRANSPOSED_KEY_CHUNK = EnvInt(None)
+    # Rejected experiments of the unshifted / transposed tiles (kept for A/B): every Nth
+    # key chunk's exp2 on the VALU, fp8 PV in the shifted tile, V^T per key chunk, bf16
+    # QK scores. Rolled q-chunk loop: SGLANG_TPU_RPA_QCHUNK_LOOP (transposed.py).
+    SGLANG_TPU_RPA_VALU_EXP2_EVERY = EnvInt(0)
     # Kernel-sweep knobs (anvil --env), read here so the compile cache keys them; unset = the
     # tuned default (dev_int). Muse megakernel tile / plan knobs (ops.py).
     SGLANG_TPU_MUSE_MK_DEV_ROW_TILE = EnvInt(None)
