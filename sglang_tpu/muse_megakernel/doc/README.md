@@ -276,6 +276,22 @@ All 62 layers, one step per shape, xprof device time on the slowest chip; anvil 
 - SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
 - It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
 
+### Decode q8 b1: where SP + EP loses to TP
+
+![decode q8 b1 TP vs SP+EP timeline](decode_q8b1_tp_vs_spep.svg)
+
+q = 8, b = 1, 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_REGIONS=2`, anvil `20261116-020308-2ac1`; LLO `20261116-020301-54f1`); before column-sliced pool / unpool. Per layer TP takes 94 us, SP + EP 173 us:
+
+| phase, per layer | TP | SP + EP |
+|---|---|---|
+| attention .. pool / router / counts | 25 us | 56 us: o-proj + row RS 15 us (TP o + AR 4.6), replicated 32 MiB pool 13 us (TP 4.5) |
+| experts | 55-65 us, even | 52-97 us: 5 to 10 experts per rank, ~9.7 us each (24 MiB fp4, ~2.6 TB/s) |
+| combine a2a / unpool / row AG | u AG ~7 us | ~45 us, mostly waiting for the busiest rank |
+
+- Expert load imbalance dominates: 64 picks per layer over 8 ranks put 10.6 experts on the busiest rank against a mean of 6.7 (TP holds 1/8 of every expert, so it stays even). The busiest rank costs 6.46 ms/step against 4.33 mean; waiting for it is ~2.6 ms/step (hatched).
+- ICI bandwidth is not the limit: once the last rank arrives, row AG takes 4.8 us, counts 3.9, items 2.9 and the o RS 13.7 per layer for 8 rows; these are latency-bound rounds of small DMAs.
+- The b1 program is r16 (8 rows padded): 305k bundles and 26.5k spills against TP r8's 175k and 11.3k.
+
 ### Prefill SP + EP over the cached context
 
 ![prefill SP+EP vs context](prefill_spep_context_sweep.svg)
