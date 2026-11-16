@@ -179,3 +179,54 @@ def check_cp_schedule(runner, backend, host):
     check_schedule_lengths(
         host.pseudo_q_lens[:rows], host.pseudo_kv_lens[:rows], capacity, "mixed"
     )
+
+
+def check_cp_ring_schedule(runner, backend, host):
+    """Check a ring-mode context-parallel extend against the fused kernel's
+    schedule buffers before any rank launches it.
+
+    The fused kernel runs two schedules (the ring over the cached prefix and
+    the new-token phase) with block sizes only the kernel package knows, so the
+    step accounting lives there; this hands it the host lengths of the rows
+    this rank will run. Every rank passes the same cache-phase rows, so the
+    ranks accept or refuse a batch together.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    # The experimental ring kernel package (not the production batched_rpa).
+    from sglang_tpu.attention.pallas.batched_rpa_pcp.wrapper import (
+        check_pcp_fused_schedule as check,
+    )
+    from sglang_tpu.attention_pallas_rpa_pcp import pcp_kv_layout
+    from sglang_tpu.pallas_export import tpu_info_for_cpu_export
+
+    ring = host.ring
+    config = runner.model_config
+    attn_tp_size = get_parallel().attn_tp_size
+    stride = backend.page_size * host.cp_size
+    pages_per_seq = -(-backend.max_context_len // stride)
+    with tpu_info_for_cpu_export():
+        check(
+            num_q_heads=config.get_num_attention_heads(attn_tp_size),
+            num_kv_heads=config.get_num_kv_heads(attn_tp_size),
+            head_dim=config.head_dim,
+            dtype_q=str(config.dtype).removeprefix("torch."),
+            dtype_kv=str(runner.token_to_kv_pool.dtype).removeprefix("torch."),
+            page_size=backend.page_size,
+            kv_layout=pcp_kv_layout(),
+            cp_group_size=host.cp_size,
+            total_q_tokens=host.local_rows_padded,
+            total_kv_tokens=host.cp_size * host.local_rows_padded,
+            cache_cu_q_lens=[0, *ring.cache_q_lens.cumsum().tolist()],
+            cache_kv_lens=ring.cache_kv_lens.tolist(),
+            cache_pages_per_row=pages_per_seq,
+            new_cu_q_lens=[0, *ring.new_q_lens.cumsum().tolist()],
+            new_kv_lens=ring.new_kv_lens.tolist(),
+            kv_cache_lens=ring.kv_cache_lens.tolist(),
+            q_positions=ring.q_positions.tolist(),
+            new_pages_per_row=pages_per_seq,
+            new_kv_pages_per_row=ring.gathered_pages,
+            num_cache_rows_live=ring.cache_num_rows,
+            num_new_rows_live=ring.new_num_rows,
+            cache_lens_cp_page_aligned=True,
+        )
