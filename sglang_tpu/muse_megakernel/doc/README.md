@@ -280,27 +280,28 @@ All 62 layers, one step per shape, xprof device time on the slowest chip; anvil 
 
 ![prefill SP+EP vs context](prefill_spep_context_sweep.svg)
 
-All 62 layers, one 4096-row chunk of one request on (3) with the decode EP weight layout, xprof device time; anvil sweeps `20261116-005013-7b9b` .. `20261116-005104-254a` (script `anvil/examples/muse_spark_prefill_spep.py`, one sweep per context), same setup as the decode sweep.
+All 62 layers, one 4096-row chunk of one request on (3) with the decode EP weight layout, xprof device time, same setup as the decode sweep; script `anvil/examples/muse_spark_prefill_spep.py`, one sweep per context. "Prefill RPA" is `attention/pallas/batched_rpa_prefill` (the P/D prefill's batched RPA: transposed tiles, ones-V row sums, exp2 softmax, full-tile mask skip; sweeps `20261116-012441-7844` .. `-012511-4f81`); "shared RPA" is `attention/pallas/batched_rpa`, which the prefill programs used before (sweeps `20261116-005013-7b9b` .. `-005104-254a`).
 
-| cached context | 0 | 16k | 64k | 128k | 256k | 512k | 756k |
-|---|---|---|---|---|---|---|---|
-| ms per chunk | 165.5 | 190.6 | 256.7 | 345.1 | 522.3 | 875.6 | 1212.3 |
-| K tok/s | 24.7 | 21.5 | 16.0 | 11.9 | 7.8 | 4.7 | 3.4 |
+| cached context | 0 | 64k | 256k | 512k | 756k |
+|---|---|---|---|---|---|
+| ms per chunk, prefill RPA | 159.0 | 210.7 | 363.6 | 570.1 | 768.0 |
+| ms per chunk, shared RPA | 165.5 | 256.7 | 522.3 | 875.6 | 1212.3 |
+| K tok/s, prefill RPA | 25.8 | 19.4 | 11.3 | 7.2 | 5.3 |
 
 Reference (2026-11-10, same chunk and contexts, 8 chips, xprof device time): TP8 native, TP8 mk-prefill and PP8 prefill.
 
 ![prefill TP8 vs PP8, 2026-11-10](prefill_tp8_vs_pp8_20261110.png)
 
-| cached context | TP8 native (AgentX env) | TP8 mk-prefill | PP8 W4A16, pipeline full | SP + EP (above) |
+| cached context | TP8 native (AgentX env) | TP8 mk-prefill | PP8 W4A16, pipeline full | SP + EP, prefill RPA |
 |---|---|---|---|---|
-| 0 | 330 ms, 12.8k tok/s | 357 ms, 11.5k | 38.3k tok/s | 165.5 ms, 24.7k |
-| 256k | ~520 ms, 7.9k | 568 ms, 7.2k | 14.2k | 522 ms, 7.8k |
-| 512k | ~710 ms, 5.8k | 781 ms, 5.2k | 8.9k | 876 ms, 4.7k |
-| 756k | ~900 ms, 4.6k | 982 ms, 4.2k | 6.6k | 1212 ms, 3.4k |
+| 0 | 330 ms, 12.8k tok/s | 357 ms, 11.5k | 38.3k tok/s | 159 ms, 25.8k |
+| 256k | ~520 ms, 7.9k | 568 ms, 7.2k | 14.2k | 364 ms, 11.3k |
+| 512k | ~710 ms, 5.8k | 781 ms, 5.2k | 8.9k | 570 ms, 7.2k |
+| 756k | ~900 ms, 4.6k | 982 ms, 4.2k | 6.6k | 768 ms, 5.3k |
 
-- SP + EP is 2x TP8 at no context (its MoE / dense: 2.67 ms/layer, as the 5-layer slice above), even with TP at ~256k, and slower past it: 1.35x TP8 native at 756k. Every 1k of context adds 1.38 ms to its chunk against 0.75 ms (TP8 native) and 0.83 ms (TP8 mk-prefill).
-- That slope is attention (RPA is 68% of the step at 256k, 86% at 756k). SP runs the same attention work as TP (an AG of a_in, then this rank's heads over every row), so its RPA being ~1.7x slower points at its RPA setup (e4m3 q with `separate_out`, q1024 / k1024 blocks), not at the SP layout; under investigation.
-- PP8 stays ahead on throughput at every context (38.3k at none); SP + EP's case is latency and the decode-compatible weight layout.
+- SP + EP beats TP8 native at every context: 2.1x at none (its MoE / dense, 2.6 ms/layer), 1.4x at 256k, 1.17x at 756k. Each 1k of context adds 0.81 ms to its chunk, about TP8's 0.75 ms: the attention work is the same (an AG of a_in, then this rank's heads over every row).
+- On the shared RPA that slope was 1.38 ms per 1k (SP + EP slower than TP8 past ~256k): it lacks the P/D prefill kernels, and the `SGLANG_TPU_RPA_*` knobs the recipe sets were read nowhere. The prefill RPA lacks main's DCP work (#1701), so both copies remain until it is merged in.
+- A whole prompt from scratch averages 19.6k tok/s at 128k (7 s), 15.8k at 256k (17 s) and 11.3k at 512k (46 s). PP8 stays ahead on throughput (38.3k at no context); SP + EP's case is latency and the decode-compatible weight layout.
 
 ## Observations
 
