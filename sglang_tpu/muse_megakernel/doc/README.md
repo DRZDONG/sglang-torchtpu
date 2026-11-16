@@ -287,8 +287,20 @@ All 62 layers, one 4096-row chunk of one request on (3) with the decode EP weigh
 | ms per chunk | 165.5 | 190.6 | 256.7 | 345.1 | 522.3 | 875.6 | 1212.3 |
 | K tok/s | 24.7 | 21.5 | 16.0 | 11.9 | 7.8 | 4.7 | 3.4 |
 
-- Up to ~16k the chunk is MoE / dense bound (2.67 ms/layer at ctx 0, as the 5-layer slice above); past 64k RPA takes over and grows linearly with the context (68% of the step at 256k, 86% at 756k).
-- A whole prompt from scratch averages 16.1k tok/s at 128k (8 s), 12.0k at 256k (22 s), 7.9k at 512k (66 s) and 5.9k at 760k (131 s). One request, one chunk per step: no batching or decode interleave.
+Reference (2026-11-10, same chunk and contexts, 8 chips, xprof device time): TP8 native, TP8 mk-prefill and PP8 prefill.
+
+![prefill TP8 vs PP8, 2026-11-10](prefill_tp8_vs_pp8_20261110.png)
+
+| cached context | TP8 native (AgentX env) | TP8 mk-prefill | PP8 W4A16, pipeline full | SP + EP (above) |
+|---|---|---|---|---|
+| 0 | 330 ms, 12.8k tok/s | 357 ms, 11.5k | 38.3k tok/s | 165.5 ms, 24.7k |
+| 256k | ~520 ms, 7.9k | 568 ms, 7.2k | 14.2k | 522 ms, 7.8k |
+| 512k | ~710 ms, 5.8k | 781 ms, 5.2k | 8.9k | 876 ms, 4.7k |
+| 756k | ~900 ms, 4.6k | 982 ms, 4.2k | 6.6k | 1212 ms, 3.4k |
+
+- SP + EP is 2x TP8 at no context (its MoE / dense: 2.67 ms/layer, as the 5-layer slice above), even with TP at ~256k, and slower past it: 1.35x TP8 native at 756k. Every 1k of context adds 1.38 ms to its chunk against 0.75 ms (TP8 native) and 0.83 ms (TP8 mk-prefill).
+- That slope is attention (RPA is 68% of the step at 256k, 86% at 756k). SP runs the same attention work as TP (an AG of a_in, then this rank's heads over every row), so its RPA being ~1.7x slower points at its RPA setup (e4m3 q with `separate_out`, q1024 / k1024 blocks), not at the SP layout; under investigation.
+- PP8 stays ahead on throughput at every context (38.3k at none); SP + EP's case is latency and the decode-compatible weight layout.
 
 ## Observations
 
