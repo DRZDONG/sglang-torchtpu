@@ -30,7 +30,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
 from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
 from sglang_tpu.models.deepseek_v41 import engram_host
-from sglang_tpu.models.deepseek_v41.dspark import flush_engram_commits
 
 
 class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
@@ -69,7 +68,7 @@ class DeepseekV4DecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         engram_host.move_hasher_to_host(hasher)
         with torch.no_grad():
             # DSpark verify commits wait here, after the next draft is dispatched.
-            flush_engram_commits(hasher)
+            engram_host.flush_engram_commits(hasher)
             hash_ids = engram_host.host_hash_ids(hasher, input_ids, forward_batch)
         num_tokens, num_layers, num_cols = hash_ids.shape
         device = input_ids.device
