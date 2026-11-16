@@ -288,7 +288,18 @@ q = 8, b = 1, 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_RE
 | experts | 55-65 us, even | 52-97 us: 5 to 10 experts per rank, ~9.7 us each (24 MiB fp4, ~2.6 TB/s) |
 | combine a2a / unpool / row AG | u AG ~7 us | ~45 us, mostly waiting for the busiest rank |
 
-- Expert load imbalance dominates: 64 picks per layer over 8 ranks put 10.6 experts on the busiest rank against a mean of 6.7 (TP holds 1/8 of every expert, so it stays even). The busiest rank costs 6.46 ms/step against 4.33 mean; waiting for it is ~2.6 ms/step (hatched).
+- The 5.2 ms/step gap (device-averaged regions, SP + EP minus TP):
+
+  | cause | ms/step |
+  |---|---|
+  | expert imbalance: waiting at combine a2a / row AG for the busiest rank (10.6 experts vs mean 6.7; TP holds 1/8 of every expert, so it stays even) | +1.95 |
+  | replicated pool + unpool (32 + 32 MiB per layer vs TP's 1/8) | +1.25 |
+  | o-proj row RS (56 x 4 KiB DMAs per layer, matmul gated on send completions) | +0.62 |
+  | expert per-chunk overhead outside the q8 arm (device mean 4.33 vs 3.78) | +0.55 |
+  | routing exchange (counts, items, dispatch, fill; TP routes locally) | +0.53 |
+  | attention on 16 padded rows, all 8 live rows on ranks 0-3 | +0.21 |
+  | row AG / combine latency after the last rank arrives, vs TP's u AG / y RS | +0.16 |
+  | qkvg | -0.10 |
 - ICI bandwidth is not the limit: once the last rank arrives, row AG takes 4.8 us, counts 3.9, items 2.9 and the o RS 13.7 per layer for 8 rows; these are latency-bound rounds of small DMAs.
 - The b1 program is r16 (8 rows padded): 305k bundles and 26.5k spills against TP r8's 175k and 11.3k. Padded rows are masked out of routing (n_live), but SP puts all 8 live rows on ranks 0-3 (2 each).
 - Per 3 MiB expert chunk the q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks). EP is ~0.24 us/chunk slower outside it (~0.6-0.8 ms/step): all four weight DMAs are awaited before the arm (TP awaits w2 inside), and every item zeroes / reads its accumulator at 32 rows.
