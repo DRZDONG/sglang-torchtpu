@@ -276,28 +276,32 @@ All 62 layers, one step per shape, xprof device time on the slowest chip; anvil 
 - SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
 - It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
 
-### Decode q8 b2: where SP + EP loses to TP
+### Decode q8 b2: TP vs the two EP arms
 
-![decode q8 b2 TP vs SP+EP timeline](decode_q8b2_tp_vs_spep.svg)
+![decode q8 b2 TP vs EP gather vs SP+EP a2a timeline](decode_q8b2_tp_vs_spep.svg)
 
-q = 8, b = 2 (16 rows: both programs r16, no row padding), 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_REGIONS=2`); anvil sweep in the chart title, redrawn by `muse-mk-tools/q8b1/chart.sh` after each change. TP 10.3 ms, SP + EP 16.0 ms per step:
+q = 8, b = 2 (16 rows; every program r16), 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_REGIONS=2`); anvil sweep in the chart title, redrawn by `muse-mk-tools/q8b1/chart.sh`. The harness now holds replicated weights (`wpool`, `wunpool`, `smalls`) and `emb` identical on every rank, as serving does (`doc/bug.md`). Untraced device time (`20261116-033833-d497`):
 
-| cause (device-averaged regions, SP + EP minus TP) | ms/step |
-|---|---|
-| expert imbalance: waiting at combine a2a / row AG for the busiest rank (16.8 experts vs mean 12.6; TP holds 1/8 of every expert) | +2.08 |
-| experts at the same bytes: 2.6 TB/s against TP's 3.1 (device mean 7.52 vs 6.25 ms) | +1.27 |
-| replicated pool + router (32 MiB per layer vs TP's 1/8) | +0.59 |
-| o-proj row RS (8-row blocks per owner at 2 own rows; 56 DMAs per layer) | +0.57 |
-| replicated unpool | +0.56 |
-| routing exchange (counts, items, dispatch, fill; TP routes locally) | +0.55 |
-| attention core | +0.20 |
-| collective latency after the last rank arrives | +0.19 |
-| qkvg | -0.18 |
+| | b1 | b2 |
+|---|---|---|
+| (4) TP | 6.32 ms | 10.00 ms |
+| (5) EP gather, rows replicated | 8.85 ms | 11.87 ms |
+| (7) SP + EP a2a, rows sharded (column-sliced pool / unpool) | 11.01 ms | 14.30 ms |
 
-- ICI bandwidth is not the limit: once the last rank arrives, each collective is a few us per layer of latency-bound small DMAs.
-- Per 3 MiB expert chunk the q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks; b1 LLO `20261116-020301-54f1`). EP is slower outside it: all four weight DMAs are awaited before the arm (TP awaits w2 inside), and every item zeroes / reads its accumulator at 32 rows.
-- Tried: one o RS DMA per owner after the last column tile (+0.2 ms, loses the overlap with the matmul); o through TP's column RS + AG (-0.14 ms at b1, +0.74 ms at b8: unfolded post-attention pass); waiting for w2 between gate|up and down (+0.9 ms at b2: the wait inside the arm serializes it).
-- The expert loop is not DMA-bound: with the arms skipped (SGLANG_TPU_EP_DEV_SKIP=experts) a 3 MiB chunk's four DMAs take 0.91 us (3.5 TB/s), under the q8 arm's 0.97 us; the rest is ~0.2 us/chunk of issue, item and loop work (TP ~0.1).
+- At these row counts the gather arm beats the a2a arm by 2.2-2.4 ms. Both hold the same weights. At 16 rows every collective round costs a few us of latency whatever its bytes. The a2a arm pays for a row reduce-scatter in 8-row blocks, a row gather plus a block return around the pool and again around the unpool, the count exchange before the ragged dispatch, and the next layer's row gather. The gather arm has none of these.
+- Gather vs TP is +2.47 ms/step with traces on:
+  - expert imbalance +1.65 (waiting in u_rs: 2.04 vs TP's 0.39 in u_ag; the busiest rank holds 15.5 experts vs a mean of 11.2, so its experts take 8.34 ms/step vs a mean of 6.30);
+  - o-proj RS + AG +0.44;
+  - the f AG wait after the unpool +0.31;
+  - the u RS itself +0.28;
+  - expert streaming +0.13 (the device means are equal within noise: 6.30 vs 6.17 ms);
+  - qkvg -0.18.
+- The expert q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks per 3 MiB chunk, b1 LLO `20261116-020301-54f1`). With the arms skipped (SGLANG_TPU_EP_DEV_SKIP=experts), a chunk's four DMAs take 0.91 us (3.5 TB/s), under the arm's 0.97 us, so the expert loop is not DMA-bound.
+- Tried on the a2a arm and reverted:
+  - one o RS DMA per owner after the last column tile: +0.2 ms, it loses the overlap with the matmul;
+  - o through TP's column RS + AG: -0.14 ms at b1, +0.74 ms at b8 (an unfolded post-attention pass);
+  - waiting for w2 between gate|up and down: +0.9 ms at b2, the wait inside the arm serializes it.
+- Column-sliced pool / unpool on the a2a arm (`SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS`, default 16), change per step: -0.4 ms at 16 rows; +0.27 / +0.55 / +0.35 / +0.98 ms at 24 / 32 / 40 / 64 rows, where gathering every row costs more than the weight reads it saves.
 
 ### Prefill SP + EP over the cached context
 
