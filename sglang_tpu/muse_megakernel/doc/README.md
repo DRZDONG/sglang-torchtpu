@@ -128,7 +128,7 @@ If prefill runs SP + EP, decode has to read the same weights: experts become 32 
 - `gather` (default): **EP**, every row on every rank. Columns (5), and (6) with target dtypes.
 - `a2a`: **SP + EP**, each rank owns R/8 rows, the MoE behind ragged all-to-alls. Columns (7), and (8) with target dtypes.
 
-There is no row-count threshold: both run at any R (a multiple of 16; EP forces the row-tiled program). All decode columns use R=64: with spec decoding a decode step carries several draft rows per request, so R=32 understates it.
+Both run at any R that is a multiple of 16 (EP forces the row-tiled program), except that the gather arm's replicated per-row VMEM buffers cap it at 128 rows. All decode columns use R=64: with spec decoding a decode step carries several draft rows per request, so R=32 understates it.
 
 | # | (5) gather, rows replicated | KiB/row | (7) a2a, rows sharded | KiB/row @R=64 |
 |---|---|---|---|---|
@@ -260,21 +260,34 @@ Decode, ms per layer (kernel-73 session, single host 2x2x1, 6 layers (global 1, 
 - (9) is slower than (8) here: each extra AG / a2a pair pays a kernel launch and sync in the XLA program, which costs more than the 56 MiB/layer of weight reads it saves. That may change once it is fused into the megakernel.
 - (5) vs (4) at R=64: the profile puts the EP gap at a 43 us RS wait (expert imbalance) plus about 30 us of unfolded AG waits and o_proj.
 
-### Decode megakernel sweep, (4) TP vs (7) SP + EP a2a
+### Decode megakernel sweep, (4) TP vs (5) EP gather vs (7) SP + EP a2a
 
-![decode TP vs SP+EP](decode_tp_vs_spep_sweep.svg)
+![decode TP vs EP gather vs SP+EP a2a](decode_tp_vs_spep_sweep.svg)
 
-All 62 layers, one step per shape, xprof device time on the slowest chip; anvil sweep `20261116-001807-e200` (script `anvil/examples/muse_spark_decode_spep.py` in tpu-perf-forge, sglang at 3517b4e3f7), single host 2x2x1, synthetic weights, QBLOCK=256, fp8 SEQ_ALONG_LANE KV, every request at the same context. q = rows per request (1: decode, 4 / 8: DFlash verify); interactivity uses PR #2099's acceptance (AL 3.06 / 4.05, draft 1.0 ms). SP + EP / TP step time:
+Setup:
+
+- All 62 layers, one step per shape. xprof device time on the slowest chip.
+- anvil sweeps, one per context: `20261116-034534-39b0` (32k), `20261116-040412-7631` (256k), `20261116-034542-7b82` (756k).
+- Script `anvil/examples/muse_spark_decode_spep.py` in tpu-perf-forge; replicated weights and `emb` are identical on every rank.
+- Single host 2x2x1, QBLOCK=256, fp8 SEQ_ALONG_LANE KV, every request at the same context. The a2a arm uses column-sliced pool / unpool at 16 rows.
+- q = rows per request (1: decode, 4 / 8: DFlash verify). Interactivity uses PR #2099's acceptance (AL 3.06 / 4.05, draft 1.0 ms).
+- The gather arm stops at 128 rows: its replicated per-row buffers exceed VMEM past that.
+
+Step time over TP, gather / a2a:
 
 | q, context | b1 | b4 | b8 | b16 | b32 |
 |---|---|---|---|---|---|
-| 1, 32k | 2.48x | 2.05x | 1.72x | 1.50x | 1.30x |
-| 1, 756k | 1.94x | 1.43x | 1.26x | 1.15x | 1.08x |
-| 8, 32k | 1.84x | 1.37x | 1.17x | 1.12x | 0.99x |
-| 8, 756k | 1.60x | 1.23x | 1.09x | 1.04x | 0.99x |
+| 1, 32k | 1.74x / 2.41x | 1.49x / 1.95x | 1.39x / 1.64x | 1.18x / 1.36x | 1.12x / 1.25x |
+| 1, 256k | 1.62x / 2.21x | 1.40x / 1.64x | 1.25x / 1.41x | 1.13x / 1.23x | 1.06x / 1.14x |
+| 1, 756k | 1.48x / 1.89x | 1.22x / 1.40x | 1.14x / 1.25x | 1.06x / 1.12x | 1.03x / 1.07x |
+| 8, 32k | 1.40x / 1.73x | 1.13x / 1.27x | 1.06x / 1.10x | 1.08x / 1.09x | - / 0.99x |
+| 8, 256k | 1.40x / 1.66x | 1.12x / 1.24x | 1.04x / 1.08x | 1.05x / 1.06x | - / 0.99x |
+| 8, 756k | 1.28x / 1.51x | 1.09x / 1.18x | 1.03x / 1.05x | 1.03x / 1.04x | - / 0.99x |
 
-- SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
-- It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
+- Up to 128 rows the gather arm beats the a2a arm at every point. It holds the same weights and moves more bytes per collective, but takes fewer latency-bound rounds and no count exchange.
+- The gather arm's remaining gap to TP is mostly expert imbalance: the busiest rank's whole experts set the step. TP splits every expert evenly.
+- The a2a arm reaches TP at 256 rows (q8 x b32) at every context.
+- Long context hides both arms' overhead behind attention, which all three programs share.
 
 ### Decode q8 b2: TP vs the two EP arms
 
