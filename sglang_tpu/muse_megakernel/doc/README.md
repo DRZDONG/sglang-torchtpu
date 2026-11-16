@@ -350,7 +350,7 @@ Reference (2026-11-10, same chunk and contexts, 8 chips, xprof device time): TP8
 
 - SP + EP beats TP8 native at every context: 2.1x at none (its MoE / dense, 2.6 ms/layer), 1.4x at 256k, 1.17x at 756k. Each 1k of context adds 0.81 ms to its chunk, about TP8's 0.75 ms: the attention work is the same (an AG of a_in, then this rank's heads over every row).
 - The shared `attention/pallas/batched_rpa` has none of the P/D prefill kernels (the recipe's `SGLANG_TPU_RPA_*` knobs are read nowhere there): on it this slope is 1.38 ms per 1k and SP + EP falls behind TP8 past ~256k. `batched_rpa_prefill` lacks main's DCP work (#1701), so both copies remain until that is merged in.
-- A whole prompt from scratch averages 19.6k tok/s at 128k (7 s), 15.8k at 256k (17 s) and 11.3k at 512k (46 s). PP8 stays ahead on throughput (38.3k at no context); SP + EP's case is latency and the decode-compatible weight layout.
+- A whole prompt from scratch averages 19.6k tok/s at 128k (7 s), 15.8k at 256k (17 s) and 11.3k at 512k (46 s). TP8 native (interpolated from its four chunk times) averages 10.9k (12 s), 9.7k (27 s) and 7.9k (66 s): SP + EP fills a prompt 1.4-1.8x sooner. PP8 stays ahead on throughput (38.3k at no context); SP + EP's case is latency and the decode-compatible weight layout.
 
 ## Observations
 
