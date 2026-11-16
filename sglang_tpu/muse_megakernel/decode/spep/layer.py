@@ -35,6 +35,7 @@ from sglang_tpu.muse_megakernel.decode.spep import attn, route
 from sglang_tpu.muse_megakernel.decode.spep.config import (
     DN_TN,
     EPPlan,
+    col_pool,
     ep_buffers,
     ep_plan,
     ep_scratch,
@@ -115,7 +116,10 @@ class EPExperts:
             route.own_topk(c, p, S, step.smr, win)
             route.send_places(c, p, S, step.n_live, win)
         with _phase("pool"):
-            _pool(step, win)
+            if col_pool(c):
+                _pool_cols(step, p, win)
+            else:
+                _pool(step, win)
         with _phase("fill"):
             _fill_send(step, p, win)
         moving = not _dev_skip("a2a")
@@ -139,16 +143,32 @@ class EPExperts:
         with _phase("experts"):
             expert_loop(step, p, n_items, dispatched)
         if not _dev_skip("unpool"):  # its first weight tiles stream under the y return
-            stream_prefetch(
-                S, step.W["wunpool"], step.layer, c.expert_hidden, c.hidden, 0, DN_TN
-            )
+            if col_pool(c):
+                hc = c.hidden // c.tp
+                stream_prefetch(
+                    S, step.W["wunpool"], step.layer, c.expert_hidden, hc, me * hc, hc
+                )
+            else:
+                stream_prefetch(
+                    S,
+                    step.W["wunpool"],
+                    step.layer,
+                    c.expert_hidden,
+                    c.hidden,
+                    0,
+                    DN_TN,
+                )
         with _phase("combine_a2a"):
             if moving:
                 a2a.mk_wait_give_back(c, S, me)
         with _phase("combine"):
             _combine(step, win)
         with _phase("unpool"):
-            _unpool_residual(step, win)
+            if col_pool(c):
+                _unpool_cols(step, p, win)
+                _ffn_residual(step, win)
+            else:
+                _unpool_residual(step, win)
         with _phase("allgather"):
             if step.next_smalls is not None and not _dev_skip("lhs_f32"):
                 _gather_lhs(step, p, step.next_smalls())
@@ -189,6 +209,143 @@ def _pool(step: EPLayerStep, win) -> None:
     )
     x = _rms(S["ep_u"][...], c.rms_eps, small_row(smr, "pre_expert_w", He)).astype(bf16)
     S["ep_xo"][...] = _pack_bf16x2(x.astype(f32))
+
+
+def _scale_slice(S: dict, smr, name: str, me, n: int) -> jax.Array:
+    """[1, n] f32: columns [me * n, (me + 1) * n) of smalls row `name`."""
+    sc = S["ep_csc"]
+    cp = pltpu.make_async_copy(
+        smr.at[pl.ds(SMALL[name], 1), pl.ds(pl.multiple_of(me * n, n), n)],
+        sc.at[pl.ds(0, 1), pl.ds(0, n)],
+        S["ep_cx_sems"].at[2],
+    )
+    cp.start()
+    cp.wait()
+    return sc[pl.ds(0, 1), pl.ds(0, n)]
+
+
+def _stage_by_owner(stage, rc: int, y: jax.Array) -> None:
+    """stage[k, :rc] = owner k's rows of y ([R, W] f32) as bf16 pairs."""
+    v = _pack_bf16x2(y)
+    for k in range(stage.shape[0]):
+        stage[k, pl.ds(0, rc), :] = v[k * rc : (k + 1) * rc]
+
+
+def _blocks_to_owners(c: MKConfig, me, stage, rcv, sems) -> None:
+    """stage[k] (owner k's rows of this rank's column block, by _stage_by_owner) into rcv[me]
+    on rank k, one tile-aligned slot per DMA (a row offset off the (8, 128) tile is not a
+    valid DMA); returns once every rank's block of own rows is here. sems: [0] received,
+    [1] sent."""
+    pltpu.make_async_copy(stage.at[me], rcv.at[me], sems.at[0]).start()
+    for d in range(1, c.tp):
+        peer = (me + d) % c.tp
+        pltpu.make_async_remote_copy(
+            src_ref=stage.at[peer],
+            dst_ref=rcv.at[me],
+            send_sem=sems.at[1],
+            recv_sem=sems.at[0],
+            device_id=(peer,),
+        ).start()
+    for sem, k in ((sems.at[0], c.tp), (sems.at[1], c.tp - 1)):
+        tmpl = pltpu.make_async_copy(stage.at[0], rcv.at[0], sem)
+        for _ in range(k):
+            tmpl.wait()
+
+
+def _own_rows_of_blocks(c: MKConfig, rc: int, rcv) -> jax.Array:
+    """[rc, tp * W] f32: own rows of every rank's column block, side by side."""
+    return jnp.concatenate(
+        [_unpack_bf16x2(rcv[d, pl.ds(0, rc)]) for d in range(c.tp)], axis=1
+    )
+
+
+def _store_own(ref, w_off, rc: int, v: jax.Array) -> None:
+    """ref rows [w_off, w_off + rc) = v (an 8-row aligned block, else row by row)."""
+    if rc % 8 == 0:
+        ref[pl.ds(_aligned8(w_off), rc), :] = v
+        return
+    for r in range(rc):
+        ref[pl.ds(w_off + r, 1), :] = v[r : r + 1]
+
+
+def _pool_cols(step: EPLayerStep, p: EPPlan, win) -> None:
+    """ep_xo own rows (bf16 pairs): pool on this rank's He / tp column block of every row
+    (own pre-FFN rows all-gathered in), every rank's block of own rows back to here."""
+    c, S, smr, me = step.c, step.S, step.smr, step.me
+    H, He, rc = c.hidden, c.expert_hidden, p.rows_own
+    W = He // c.tp
+    w0, wn, w_off = win
+    own = S["ep_f"].bitcast(jnp.uint32).at[:, pl.ds(0, H // 2)]  # free until the unpool
+    own[pl.ds(0, wn), :] = _pack_bf16x2(S["lhs"][pl.ds(w0, wn), :].astype(f32))
+    with _phase("pool_ag", 2):
+        _bcast_own_rows(
+            c, me, rc, own, w_off, S["ep_lhs_g"], S["ep_lhs_sems"], S["ep_lhs_rsems"]
+        )
+        _hbm_rows_to_lhs(c, S, S["ep_lhs_g"])
+    stage = S["ep_pstage"]
+
+    def put(n0, y):
+        _stage_by_owner(stage, rc, y)
+
+    stream_matmul(
+        c,
+        S,
+        step.W["wpool"],
+        step.layer,
+        lambda k0, n: S["lhs"][:, pl.ds(k0, n)],
+        _scale_slice(S, smr, "wpool_s", me, W),
+        H,
+        W,
+        put,
+        skip=_dev_skip("pool"),
+        n_off=me * W,
+        tn=W,
+    )
+    pre = small_row(smr, "pre_expert_w", He)
+    with _phase("pool_x", 2):
+        _blocks_to_owners(c, me, stage, S["ep_prcv"], S["ep_cx_sems"])
+    x = _rms(_own_rows_of_blocks(c, rc, S["ep_prcv"]), c.rms_eps, pre).astype(bf16)
+    _store_own(S["ep_xo"], w_off, rc, _pack_bf16x2(x.astype(f32)))
+
+
+def _unpool_cols(step: EPLayerStep, p: EPPlan, win) -> None:
+    """ep_f own rows: unpool on this rank's H / tp column block of every row (own rows of u
+    all-gathered in), every rank's block of own rows back to here."""
+    c, S, smr, me = step.c, step.S, step.smr, step.me
+    H, He, rc = c.hidden, c.expert_hidden, p.rows_own
+    Hc = H // c.tp
+    _, wn, w_off = win
+    own = S["ep_f"].bitcast(jnp.uint32).at[:, pl.ds(0, He // 2)]
+    own[pl.ds(0, wn), :] = _pack_bf16x2(S["ep_u"][...])
+    with _phase("unpool_ag", 2):
+        _bcast_own_rows(
+            c, me, rc, own, w_off, S["ep_ug"], S["ep_lhs_sems"], S["ep_lhs_rsems"]
+        )
+        _hbm_rows_to_lhs(c, S, S["ep_ug"])  # lhs[:, :He]: every row's u
+    stage = S["ep_ustage"]
+
+    def put(n0, y):
+        _stage_by_owner(stage, rc, y)
+
+    stream_matmul(
+        c,
+        S,
+        step.W["wunpool"],
+        step.layer,
+        lambda k0, n: S["lhs"][:, pl.ds(k0, n)],
+        _scale_slice(S, smr, "wunpool_s", me, Hc),
+        He,
+        Hc,
+        put,
+        skip=_dev_skip("unpool"),
+        n_off=me * Hc,
+        tn=Hc,
+        prefetched=True,
+    )
+    with _phase("unpool_x", 2):
+        _blocks_to_owners(c, me, stage, S["ep_urcv"], S["ep_cx_sems"])
+    f = _own_rows_of_blocks(c, rc, S["ep_urcv"])
+    _store_own(S["ep_f"], w_off, rc, f.astype(bf16).astype(f32))
 
 
 def _fill_send(step: EPLayerStep, p: EPPlan, win) -> None:
@@ -653,9 +810,15 @@ def _stream_rows(c: MKConfig, S: dict):
 
 def _unpool_residual(step: EPLayerStep, win) -> None:
     """Own rows of S["h_stream"]: ffn_alpha * stream + ffn_beta * norm(unpool(u) * post_ffn_w)."""
+    _unpool_rows(step, win)
+    _ffn_residual(step, win)
+
+
+def _unpool_rows(step: EPLayerStep, win) -> None:
+    """ep_f (window rows) = unpool(u) on every column, own rows of the window."""
     c, S, smr = step.c, step.S, step.smr
-    H, He, rc = c.hidden, c.expert_hidden, c.rows_per_dev
-    w0, wn, w_off = win
+    H, He = c.hidden, c.expert_hidden
+    _, wn, _ = win
 
     def put(n0, y):
         S["ep_f"][pl.ds(0, wn), pl.ds(n0, y.shape[1])] = y.astype(bf16).astype(f32)
@@ -673,6 +836,13 @@ def _unpool_residual(step: EPLayerStep, win) -> None:
         skip=_dev_skip("unpool"),
         prefetched=True,
     )
+
+
+def _ffn_residual(step: EPLayerStep, win) -> None:
+    """Own rows of S["h_stream"] += the FFN branch: ffn_beta * norm(ep_f * post_ffn_w)."""
+    c, S, smr = step.c, step.S, step.smr
+    H, rc = c.hidden, c.rows_per_dev
+    w0, wn, w_off = win
     fw = S["ep_f"][pl.ds(0, wn), :] * small_row(smr, "post_ffn_w", H)
     S["ep_f"][pl.ds(0, wn), :] = _rms(fw, c.post_eps).astype(bf16).astype(f32)
     _, rows = _stream_rows(c, S)
@@ -712,13 +882,22 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
 
     with _phase("lhs_norm"):
         rows(me * rc, rc, norm, write_back=False)
-    n = rc if rc % 8 == 0 else 1  # rows per copy: a block, or a row of an unaligned one
+    _bcast_own_rows(c, me, rc, own, 0, g, sems, rsems)
+
+
+def _bcast_own_rows(c: MKConfig, me, rc: int, own, off, g, sems, rsems) -> None:
+    """Rows [off, off + rc) of the VMEM u32 own buffer into rows [me * rc, (me + 1) * rc) of
+    g ([R, W] u32) on every rank; returns once every owner's rows have landed here.
+    sems: [1] sent, [2] own copy; rsems[k]: owner k's rows received."""
+    # rows per copy: a block, or a row of an unaligned one
+    blocked = rc % 8 == 0 and isinstance(off, int) and off % 8 == 0
+    n = rc if blocked else 1
 
     def block(k):
-        """Per copy: (rows in the [rc]-row own buffer, owner k's rows in ep_lhs_g)."""
-        if rc % 8 == 0:
-            return [(pl.ds(0, rc), pl.ds(pl.multiple_of(k * rc, 8), rc))]
-        return [(pl.ds(r, 1), pl.ds(k * rc + r, 1)) for r in range(rc)]
+        """Per copy: (rows in own, owner k's rows in g)."""
+        if blocked:
+            return [(pl.ds(off, rc), pl.ds(pl.multiple_of(k * rc, 8), rc))]
+        return [(pl.ds(off + r, 1), pl.ds(k * rc + r, 1)) for r in range(rc)]
 
     def send(src_buf, k, peer):  # owner k's rows from src_buf to peer's ep_lhs_g
         for src, dst in block(k):
@@ -765,13 +944,19 @@ def _gather_lhs(step: EPLayerStep, p: EPPlan, nsmr) -> None:
 
 
 def _pre_attn_lhs(c: MKConfig, S: dict) -> None:
-    """S["lhs"] = every row of ep_lhs_g as bf16, row tile by row tile (double-buffered)."""
-    RT, R, Hh = c.row_tile, c.rows, c.hidden // 2
-    g, sems = S["ep_lhs_g"], S["ep_lhs_sems"]
+    """S["lhs"] = every row of ep_lhs_g as bf16."""
+    _hbm_rows_to_lhs(c, S, S["ep_lhs_g"])
+
+
+def _hbm_rows_to_lhs(c: MKConfig, S: dict, g) -> None:
+    """S["lhs"][:, :2 W] = every row of g ([R, W] bf16 pairs in HBM, W <= H / 2) as bf16, row
+    tile by row tile (double-buffered through two [RT, H / 2] word slots)."""
+    RT, R, Hh, W = c.row_tile, c.rows, c.hidden // 2, g.shape[1]
+    sems = S["ep_lhs_sems"]
     st = S["ep_lhs_stage"] if c.tiled_vmem_pads else S["sin"].at[0].bitcast(jnp.uint32)
 
-    def stage(b):  # two slots of [RT, H / 2] words side by side
-        return st.at[:, pl.ds(b * Hh, Hh)]
+    def stage(b):
+        return st.at[:, pl.ds(b * Hh, W)]
 
     def cp(t):
         return pltpu.make_async_copy(
@@ -783,7 +968,9 @@ def _pre_attn_lhs(c: MKConfig, S: dict) -> None:
         if t + 1 < R // RT:
             cp(t + 1).start()
         cp(t).wait()
-        S["lhs"][pl.ds(t * RT, RT), :] = _unpack_bf16x2(stage(t % 2)[...]).astype(bf16)
+        S["lhs"][pl.ds(t * RT, RT), pl.ds(0, 2 * W)] = _unpack_bf16x2(
+            stage(t % 2)[...]
+        ).astype(bf16)
 
 
 def _all_gather_rows(step: EPLayerStep, p: EPPlan, only_captured: bool = False) -> None:

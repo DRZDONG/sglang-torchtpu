@@ -666,6 +666,12 @@ class TpuEnvs:
     SGLANG_TPU_MUSE_MK_DEV_TILED_VY_MIN_DEPTH = EnvInt(None)
     # EP decode paradigm: gather (EP, rows replicated) | a2a (SP + EP, rows sharded).
     SGLANG_TPU_MUSE_MK_EP_ARM = EnvStr("gather")
+    # a2a arm, steps of at most this many rows: pool / unpool on this rank's 1/tp column
+    # slice of the replicated weights over every row (rows all-gathered in, results back to
+    # their owners) instead of every column on own rows: 4 + 4 MiB of weight reads per layer
+    # instead of 32 + 32. Larger steps lose more to gathering every row than they save (q8:
+    # -0.4 ms at 16 rows, +0.35 at 40, +1.0 at 64). 0 turns it off.
+    SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS = EnvInt(16)
     # Largest EP block-diagonal arm in rows (decode/spep/experts.BD_ARMS).
     SGLANG_TPU_EP_BD_MAX = EnvInt(None)
     # Rows from which EP all-gathers relay through the partner core (gather.PAIR_AG_MIN_ROWS).

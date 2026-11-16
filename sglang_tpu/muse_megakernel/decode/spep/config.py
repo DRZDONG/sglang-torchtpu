@@ -217,45 +217,78 @@ def ep_scratch(c: MKConfig, p: EPPlan) -> list:
     items = item_scratch(c, p)
     if c.tiled_vmem_pads:
         items += [("ep_lhs_stage", vmem((c.row_tile, c.hidden), u32))]
-    return items + [
-        # window rows: pooled expert input (bf16 pairs), routing, slot places in ep_xs, the
-        # pooled / combined f32, the unpool output and FFN branch
-        ("ep_xo", vmem((win, he // 2), u32)),
-        ("ep_ids", vmem((win, LANE), i32)),
-        ("ep_wsel", vmem((win, LANE), f32)),
-        ("ep_pos_v", vmem((8, LANE), i32)),  # [slot k, window row] (window <= LANE)
-        ("ep_pos_s", smem((8, LANE), i32)),
-        ("ep_u", vmem((win, he), f32)),
-        ("ep_f", vmem((win, c.hidden), f32)),
-        # row reduce-scatter of the o-proj: this rank's blocks of each wo column tile for every
-        # owner (two tiles in flight), every rank's blocks of this rank's rows
-        ("ep_osend", vmem((2, tp, p.rows_own_padded, c.hidden_local // 2), u32)),
-        ("ep_orecv", vmem((tp * tp, p.rows_own_padded, c.hidden_local // 2), u32)),
-        ("ep_o_sems", dma((3,))),  # received, sent from each send buffer
-        # slots per (source rank, expert), every rank's row
-        ("ep_csend", vmem((8, c.n_experts), i32)),
-        ("ep_cnt_v", vmem((tp, c.n_experts), i32)),
-        ("ep_tab_v", vmem((TAB_ROWS, LANE), i32)),  # route.slot_tables
-        ("ep_tab_s", smem((TAB_ROWS, LANE), i32)),
-        # the two ragged all-to-alls: own slots by destination (and expert), received slots
-        # by source (and expert); y goes back row by row from the expert loop
-        ("ep_xs", hbm((p.send_rows, he // 2), u32)),
-        ("ep_xr", hbm((p.recv_rows, he // 2), u32)),
-        ("ep_yb", hbm((p.send_rows, he // 2), u32)),
-        ("ep_items", smem((1 + 3 * p.max_items,), i32)),
-        ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
-        ("ep_yrow", vmem((4, k, he // 2), u32)),  # own rows' slots in flight (combine)
-        ("ep_w_sems", dma((p.nslot, 4))),
-        ("ep_dn_sems", dma((p.nslot,))),
-        ("ep_x_sems", dma((2,))),
-        ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
-        ("ep_cnt_sems", dma((2,))),  # count rows: received, sent
-        ("ep_a2a_sems", dma((4,))),  # dispatch received / sent, return received / sent
-        ("ep_yrow_sems", dma((4,))),
-        ("ep_ag_sems", dma((2,))),  # row all-gather: received, sent
-        # the next layer's pre-attention input (bf16 pairs): every row's in HBM (own rows
-        # staged in ep_f), its row tiles on the way into lhs (through sin[0] with HBM pads)
-        ("ep_lhs_g", hbm((c.rows, c.hidden // 2), u32)),
-        ("ep_lhs_sems", dma((5,))),  # (unused), sent, own copy, stage slots
-        ("ep_lhs_rsems", dma((tp,))),  # each owner's rows received
+    return (
+        items
+        + [
+            # window rows: pooled expert input (bf16 pairs), routing, slot places in ep_xs, the
+            # pooled / combined f32, the unpool output and FFN branch
+            ("ep_xo", vmem((win, he // 2), u32)),
+            ("ep_ids", vmem((win, LANE), i32)),
+            ("ep_wsel", vmem((win, LANE), f32)),
+            ("ep_pos_v", vmem((8, LANE), i32)),  # [slot k, window row] (window <= LANE)
+            ("ep_pos_s", smem((8, LANE), i32)),
+            ("ep_u", vmem((win, he), f32)),
+            ("ep_f", vmem((win, c.hidden), f32)),
+            # row reduce-scatter of the o-proj: this rank's blocks of each wo column tile for every
+            # owner (two tiles in flight), every rank's blocks of this rank's rows
+            ("ep_osend", vmem((2, tp, p.rows_own_padded, c.hidden_local // 2), u32)),
+            ("ep_orecv", vmem((tp * tp, p.rows_own_padded, c.hidden_local // 2), u32)),
+            ("ep_o_sems", dma((3,))),  # received, sent from each send buffer
+            # slots per (source rank, expert), every rank's row
+            ("ep_csend", vmem((8, c.n_experts), i32)),
+            ("ep_cnt_v", vmem((tp, c.n_experts), i32)),
+            ("ep_tab_v", vmem((TAB_ROWS, LANE), i32)),  # route.slot_tables
+            ("ep_tab_s", smem((TAB_ROWS, LANE), i32)),
+            # the two ragged all-to-alls: own slots by destination (and expert), received slots
+            # by source (and expert); y goes back row by row from the expert loop
+            ("ep_xs", hbm((p.send_rows, he // 2), u32)),
+            ("ep_xr", hbm((p.recv_rows, he // 2), u32)),
+            ("ep_yb", hbm((p.send_rows, he // 2), u32)),
+            ("ep_items", smem((1 + 3 * p.max_items,), i32)),
+            ("ep_rows", smem((p.recv_rows,), i32)),  # received slots grouped by expert
+            (
+                "ep_yrow",
+                vmem((4, k, he // 2), u32),
+            ),  # own rows' slots in flight (combine)
+            ("ep_w_sems", dma((p.nslot, 4))),
+            ("ep_dn_sems", dma((p.nslot,))),
+            ("ep_x_sems", dma((2,))),
+            ("ep_misc_sems", dma((4,))),  # local copies: xs fill, y scatter, tables
+            ("ep_cnt_sems", dma((2,))),  # count rows: received, sent
+            (
+                "ep_a2a_sems",
+                dma((4,)),
+            ),  # dispatch received / sent, return received / sent
+            ("ep_yrow_sems", dma((4,))),
+            ("ep_ag_sems", dma((2,))),  # row all-gather: received, sent
+            # the next layer's pre-attention input (bf16 pairs): every row's in HBM (own rows
+            # staged in ep_f), its row tiles on the way into lhs (through sin[0] with HBM pads)
+            ("ep_lhs_g", hbm((c.rows, c.hidden // 2), u32)),
+            ("ep_lhs_sems", dma((5,))),  # (unused), sent, own copy, stage slots
+            ("ep_lhs_rsems", dma((tp,))),  # each owner's rows received
+        ]
+        + (col_pool_scratch(c, p) if col_pool(c) else [])
+    )
+
+
+def col_pool(c: MKConfig) -> bool:
+    """Column-sliced pool / unpool (a2a arm): SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS."""
+    return c.rows <= tpu_envs.SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS.get()
+
+
+def col_pool_scratch(c: MKConfig, p: EPPlan) -> list:
+    """Column-sliced pool / unpool: this rank's column block of every row by owner (bf16
+    pairs, each owner's rows at the top of its tile-aligned slot), every rank's block of own
+    rows, every row's combined u (bf16 pairs) and the scale slices."""
+    he, hc, tp, rcp = c.expert_hidden // c.tp, c.hidden // c.tp, c.tp, p.rows_own_padded
+    vmem, hbm = pltpu.VMEM, pltpu.HBM
+    u32 = jnp.uint32
+    return [
+        ("ep_pstage", vmem((tp, rcp, he // 2), u32)),
+        ("ep_prcv", vmem((tp, rcp, he // 2), u32)),
+        ("ep_ug", hbm((c.rows, c.expert_hidden // 2), u32)),
+        ("ep_ustage", vmem((tp, rcp, hc // 2), u32)),
+        ("ep_urcv", vmem((tp, rcp, hc // 2), u32)),
+        ("ep_csc", vmem((8, max(he, hc)), jnp.float32)),
+        ("ep_cx_sems", pltpu.SemaphoreType.DMA((3,))),  # received, sent, scale copy
     ]
