@@ -288,6 +288,16 @@ Step time over TP, gather / a2a:
 - The gather arm's remaining gap to TP is mostly expert imbalance: the busiest rank's whole experts set the step. TP splits every expert evenly.
 - The a2a arm reaches TP at 256 rows (q8 x b32) at every context.
 - Long context hides both arms' overhead behind attention, which all three programs share.
+- Purple line: the EP cut strategy, the gather arm up to 128 rows and the a2a arm past that. Right column: total throughput against interactivity, with vlines at 100 and 200 tok/s per request.
+- Choosing q for the cut strategy: total tok/s at a target interactivity, read off the right column (linear between batches; PR #2099's acceptance):
+
+  | context | q4 @ 100 | q8 @ 100 | q4 @ 200 | q8 @ 200 |
+  |---|---|---|---|---|
+  | 32k | 2453 | 2685 (+9%) | 1001 | 1091 (+9%) |
+  | 256k | 1243 | 1445 (+16%) | 736 | 801 (+9%) |
+  | 756k | 650 | 746 (+15%) | 440 | 502 (+14%) |
+
+  q = 8 wins at both targets and every context, as it does for TP (32k: 2791 / 1330 against q4's 2504 / 1429; q4 is ahead only at 200). At 100 tok/s, q8 at 32k runs past 128 rows, so that point uses the a2a arm.
 
 ### Decode q8 b2: TP vs the two EP arms
 
