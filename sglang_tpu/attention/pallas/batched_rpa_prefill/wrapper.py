@@ -706,6 +706,35 @@ def calculate_block_sizes(
     return decode_block_sizes, prefill_block_sizes
 
 
+# This module exists for the P/D prefill tiles; without them prefill attention silently runs
+# ~1.8x slower per cached token.
+_PREFILL_TILE_KNOBS = (
+    tpu_envs.SGLANG_TPU_RPA_SKIP_FULL_TILE_MASK,
+    tpu_envs.SGLANG_TPU_RPA_EXP2_SOFTMAX,
+    tpu_envs.SGLANG_TPU_RPA_ONES_V,
+    tpu_envs.SGLANG_TPU_RPA_TRANSPOSED,
+)
+
+
+def _require_prefill_tiles(serve_cfgs: configs.ServingConfigs) -> None:
+    """Raises unless every P/D prefill tile is on: its knob set and its preconditions met."""
+    off = [e.name for e in _PREFILL_TILE_KNOBS if not e.get()]
+    if off:
+        raise ValueError(f"batched_rpa_prefill needs {off} set to 1")
+    tiles = {
+        "skip_full_tile_mask": serve_cfgs.skip_full_tile_mask,
+        "exp2_softmax": serve_cfgs.exp2_softmax,
+        "ones_v": serve_cfgs.ones_v,
+        "transposed": serve_cfgs.transposed,
+    }
+    unmet = [name for name, on in tiles.items() if not on]
+    if unmet:
+        raise ValueError(
+            f"batched_rpa_prefill: {unmet} off for this call (SEQ_ALONG_LANE KV, head_dim "
+            "<= 64, causal, no q_scale / soft cap / sink / LSE / cache_only / CP)"
+        )
+
+
 @jax.jit(
     static_argnames=(
         "sm_scale",
@@ -939,6 +968,7 @@ def ragged_paged_attention(
             else out_head_norm_eps
         ),
     )
+    _require_prefill_tiles(serve_cfgs)
 
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
