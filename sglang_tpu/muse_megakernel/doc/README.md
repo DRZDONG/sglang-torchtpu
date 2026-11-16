@@ -296,7 +296,8 @@ q = 8, b = 2 (16 rows: both programs r16, no row padding), 32k context, region t
 
 - ICI bandwidth is not the limit: once the last rank arrives, each collective is a few us per layer of latency-bound small DMAs.
 - Per 3 MiB expert chunk the q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks; b1 LLO `20261116-020301-54f1`). EP is slower outside it: all four weight DMAs are awaited before the arm (TP awaits w2 inside), and every item zeroes / reads its accumulator at 32 rows.
-- Tried: one o RS DMA per owner after the last column tile (+0.2 ms, loses the overlap with the matmul); o through TP's column RS + AG (-0.14 ms at b1, +0.74 ms at b8: unfolded post-attention pass).
+- Tried: one o RS DMA per owner after the last column tile (+0.2 ms, loses the overlap with the matmul); o through TP's column RS + AG (-0.14 ms at b1, +0.74 ms at b8: unfolded post-attention pass); waiting for w2 between gate|up and down (+0.9 ms at b2: the wait inside the arm serializes it).
+- The expert loop is not DMA-bound: with the arms skipped (SGLANG_TPU_EP_DEV_SKIP=experts) a 3 MiB chunk's four DMAs take 0.91 us (3.5 TB/s), under the q8 arm's 0.97 us; the rest is ~0.2 us/chunk of issue, item and loop work (TP ~0.1).
 
 ### Prefill SP + EP over the cached context
 
