@@ -64,4 +64,5 @@ Each entry is a finding: what it is, the evidence (anvil sweep ids, all on the 2
   - Per chunk it would save about 12 ms of 158.
   - It needs two `gmm_v2` changes, both local and uncommitted: a static `lhs_quant_block_size` kwarg (it must be in `static_argnames`; leaving it out raised TracerBoolConversionError, which the anvil compilers had reported as an OOM), and the requant guard opened from INT4 / group 32 to fp4 / block 256.
   - Adopting it needs an end-to-end quality check (GSM8K).
+  - Status (2026-11-16 wrap-up): kept out of PR #2183 as `muse-mk-tools/patches/prefill_sp_fp4_requant_experiment.patch` (the gmm_v2 kwarg and guard, plus debug knobs SGLANG_TPU_MUSE_MK_PF_SP_REQUANT / _REQUANT_LHS_BLOCK / _EXPERT_TILES / _CHUNKS).
 - **`fp8_gather` and W4A16 do not apply to SP + EP.** `SGLANG_TPU_MUSE_MK_PREFILL_FP8_GATHER` sends the TP prefill's xe / u all-gathers in e4m3, and `prefill/spep/program.py` raises if it is set. `w4a16_layers` routes TP prefill's fp4 layers to the fused-RS W4A16 kernel; SP + EP always runs `gmm_v2`. The TP8 reference in the prefill chart comes from 2026-11-10 serving with both on, not from anvil.
