@@ -132,7 +132,7 @@ def store_tile(
                 # Skipped groups keep acc == 0 (l == 0): output 0 there, not NaN.
                 # Exact for real rows, whose l >= 2^-64 (a query sees its own key).
                 l = jnp.maximum(l, 1e-30)
-            o_t = acc[:hd] * pl.reciprocal(l, approx=True)
+            o_t = acc[:hd] * pltpu.reciprocal(l, approx=True)
             if cfgs.serve.out_head_norm_eps is not None:
                 o_t = utils.head_norm(
                     o_t.astype(cfgs.serve.dtype_out),
