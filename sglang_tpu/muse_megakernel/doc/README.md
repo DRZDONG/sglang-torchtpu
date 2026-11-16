@@ -260,6 +260,22 @@ Decode, ms per layer (kernel-73 session, single host 2x2x1, 6 layers (global 1, 
 - (9) is slower than (8) here: each extra AG / a2a pair pays a kernel launch and sync in the XLA program, which costs more than the 56 MiB/layer of weight reads it saves. That may change once it is fused into the megakernel.
 - (5) vs (4) at R=64: the profile puts the EP gap at a 43 us RS wait (expert imbalance) plus about 30 us of unfolded AG waits and o_proj.
 
+### Decode megakernel sweep, (4) TP vs (7) SP + EP a2a
+
+![decode TP vs SP+EP](decode_tp_vs_spep_sweep.svg)
+
+All 62 layers, one step per shape, xprof device time on the slowest chip; anvil sweep `20261116-001807-e200` (script `anvil/examples/muse_spark_decode_spep.py` in tpu-perf-forge, sglang at 3517b4e3f7), single host 2x2x1, synthetic weights, QBLOCK=256, fp8 SEQ_ALONG_LANE KV, every request at the same context. q = rows per request (1: decode, 4 / 8: DFlash verify); interactivity uses PR #2099's acceptance (AL 3.06 / 4.05, draft 1.0 ms). SP + EP / TP step time:
+
+| q, context | b1 | b4 | b8 | b16 | b32 |
+|---|---|---|---|---|---|
+| 1, 32k | 2.48x | 2.05x | 1.72x | 1.50x | 1.30x |
+| 1, 756k | 1.94x | 1.43x | 1.26x | 1.15x | 1.08x |
+| 8, 32k | 1.84x | 1.37x | 1.17x | 1.12x | 0.99x |
+| 8, 756k | 1.60x | 1.23x | 1.09x | 1.04x | 0.99x |
+
+- SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
+- It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
+
 ## Observations
 
 - **(2) moves about 3.3x less comm than (1)** (34.4 vs 112 KiB/row). Its MoE costs 13.4 KiB/row (fp8 dispatch + bf16 combine) against 63 KiB/row for expert-TP in (1) (routing psum + y RS + y AG); replicated pooler / unpooler also drop the xe and u AG (21 KiB/row).
@@ -283,6 +299,7 @@ Both arms need replicated wpool / wunpool and 32 whole experts per rank. Serving
 | Program selection, weight packing | [ops.py](../ops.py) |
 | Prefill TP | [prefill/tp/program.py](../prefill/tp/program.py), [attn_out.py](../prefill/tp/attn_out.py), [post_moe.py](../prefill/tp/post_moe.py) |
 | Prefill SP + EP | [prefill/spep/program.py](../prefill/spep/program.py), [common/a2a.py](../common/a2a.py) (remote-DMA MoE a2a), [moe/pallas/gmm_v2.py](../../moe/pallas/gmm_v2.py) |
-| Decode | [decode/tp/kernel.py](../decode/tp/kernel.py), [common/stream.py](../common/stream.py), [common/plan.py](../common/plan.py) |
+| Decode TP | [decode/tp/kernel.py](../decode/tp/kernel.py) (build, layer loop), [attn.py](../decode/tp/attn.py) / [moe.py](../decode/tp/moe.py) (untiled), [tiled_attn.py](../decode/tp/tiled_attn.py) / [tiled_moe.py](../decode/tp/tiled_moe.py) / [tiled_layer.py](../decode/tp/tiled_layer.py) (row-tiled), [common/stream.py](../common/stream.py), [common/plan.py](../common/plan.py) |
+| Decode SP + EP | [decode/spep/](../decode/spep/) (EPHook arms), [common/a2a.py](../common/a2a.py), [common/ep_layout.py](../common/ep_layout.py) (weight layout shared with prefill SP) |
 | Comm primitives | [common/coll.py](../common/coll.py) (`Coll` for decode, `GridColl` for prefill TP), [common/packing.py](../common/packing.py) |
 | fused-RS MoE | [moe/pallas/fused_rs/](../../moe/pallas/fused_rs/) |
