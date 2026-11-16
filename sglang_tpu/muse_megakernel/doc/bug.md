@@ -46,14 +46,14 @@ reads `N_LAYERS` at import time, so it cannot be set through `--env`.
 ```bash
 cd /home/junyanxu_google_com/nfs/code/tpu-perf-forge
 python3 -m anvil --controller 172.27.0.4:50060 sweep \
-  --script anvil/examples/muse_spark_decode_spep_l3.py \
+  --script /home/junyanxu_google_com/nfs/code/muse-mk-tools/q8b1/muse_spark_decode_spep_l3.py \
   --checkout /home/junyanxu_google_com/nfs/code/sglang-muse-disagg-kernel \
-  --runner 10.36.110.243:50062 --dim mode=2 --dim q=8 --dim batch=2 --dim context=32768 \
-  --env SGLANG_TPU_MUSE_MK_EP_COL_POOL=1 --env SGLANG_TPU_MUSE_MK_EP_COL_POOL_PARTS=pool \
-  --control-env SGLANG_TPU_MUSE_MK_EP_COL_POOL=0 --detach
+  --dim mode=2 --dim q=8 --dim batch=2 --dim context=32768 \
+  --env SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS=16 \
+  --control-env SGLANG_TPU_MUSE_MK_EP_COL_POOL_MAX_ROWS=0 --detach
 ```
 
-Read the result with `curl http://172.27.0.4:50070/v1/sweeps/<id>`, under
+(Today's knob; the bisection below ran SGLANG_TPU_MUSE_MK_EP_COL_POOL=1 with the PARTS tokens, since removed.) Read the result with `curl http://172.27.0.4:50070/v1/sweeps/<id>`, under
 `per_shape[].diffs[].vs_control`. That value is the worst row's `max|a - b| / max|b|`; 0 means
 bit-identical. Geometry: tp = 8 (2x2x1, 4 chips x 2 cores), 16 rows at b2 (`rc = 2`, window 16),
 H 8192, He 4096, column block W = He / 8 = 512.
