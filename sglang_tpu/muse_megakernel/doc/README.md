@@ -276,6 +276,20 @@ All 62 layers, one step per shape, xprof device time on the slowest chip; anvil 
 - SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
 - It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
 
+### Prefill SP + EP over the cached context
+
+![prefill SP+EP vs context](prefill_spep_context_sweep.svg)
+
+All 62 layers, one 4096-row chunk of one request on (3) with the decode EP weight layout, xprof device time; anvil sweeps `20261116-005013-7b9b` .. `20261116-005104-254a` (script `anvil/examples/muse_spark_prefill_spep.py`, one sweep per context), same setup as the decode sweep.
+
+| cached context | 0 | 16k | 64k | 128k | 256k | 512k | 756k |
+|---|---|---|---|---|---|---|---|
+| ms per chunk | 165.5 | 190.6 | 256.7 | 345.1 | 522.3 | 875.6 | 1212.3 |
+| K tok/s | 24.7 | 21.5 | 16.0 | 11.9 | 7.8 | 4.7 | 3.4 |
+
+- Up to ~16k the chunk is MoE / dense bound (2.67 ms/layer at ctx 0, as the 5-layer slice above); past 64k RPA takes over and grows linearly with the context (68% of the step at 256k, 86% at 756k).
+- A whole prompt from scratch averages 16.1k tok/s at 128k (8 s), 12.0k at 256k (22 s), 7.9k at 512k (66 s) and 5.9k at 760k (131 s). One request, one chunk per step: no batching or decode interleave.
+
 ## Observations
 
 - **(2) moves about 3.3x less comm than (1)** (34.4 vs 112 KiB/row). Its MoE costs 13.4 KiB/row (fp8 dispatch + bf16 combine) against 63 KiB/row for expert-TP in (1) (routing psum + y RS + y AG); replicated pooler / unpooler also drop the xe and u AG (21 KiB/row).
