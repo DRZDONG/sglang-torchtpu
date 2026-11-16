@@ -276,33 +276,27 @@ All 62 layers, one step per shape, xprof device time on the slowest chip; anvil 
 - SP + EP pays a near-constant ~4-6 ms per step over TP (62 layers): at small R the EP rows pad to 16 (TP's untiled program runs 8), the busiest rank reads more expert bytes than TP's even split, and replicated pool / unpool are read in full. Long context hides it behind attention, which both share.
 - It reaches TP at 256 rows (q8 x b32) at both contexts. Below that, TP decode stays faster; column-sliced pool / unpool ((9)), a segmented y return and expert load balancing target the gap.
 
-### Decode q8 b1: where SP + EP loses to TP
+### Decode q8 b2: where SP + EP loses to TP
 
-![decode q8 b1 TP vs SP+EP timeline](decode_q8b1_tp_vs_spep.svg)
+![decode q8 b2 TP vs SP+EP timeline](decode_q8b2_tp_vs_spep.svg)
 
-q = 8, b = 1, 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_REGIONS=2`, anvil `20261116-020308-2ac1`; LLO `20261116-020301-54f1`); before column-sliced pool / unpool. Per layer TP takes 94 us, SP + EP 173 us:
+q = 8, b = 2 (16 rows: both programs r16, no row padding), 32k context, region traces on all 8 ranks (`SGLANG_TPU_MK_TRACE_REGIONS=2`); anvil sweep in the chart title, redrawn by `muse-mk-tools/q8b1/chart.sh` after each change. TP 10.3 ms, SP + EP 16.0 ms per step:
 
-| phase, per layer | TP | SP + EP |
-|---|---|---|
-| attention .. pool / router / counts | 25 us | 56 us: o-proj + row RS 15 us (TP o + AR 4.6), replicated 32 MiB pool 13 us (TP 4.5) |
-| experts | 55-65 us, even | 52-97 us: 5 to 10 experts per rank, ~9.7 us each (24 MiB fp4, ~2.6 TB/s) |
-| combine a2a / unpool / row AG | u AG ~7 us | ~45 us, mostly waiting for the busiest rank |
+| cause (device-averaged regions, SP + EP minus TP) | ms/step |
+|---|---|
+| expert imbalance: waiting at combine a2a / row AG for the busiest rank (16.8 experts vs mean 12.6; TP holds 1/8 of every expert) | +2.08 |
+| experts at the same bytes: 2.6 TB/s against TP's 3.1 (device mean 7.52 vs 6.25 ms) | +1.27 |
+| replicated pool + router (32 MiB per layer vs TP's 1/8) | +0.59 |
+| o-proj row RS (8-row blocks per owner at 2 own rows; 56 DMAs per layer) | +0.57 |
+| replicated unpool | +0.56 |
+| routing exchange (counts, items, dispatch, fill; TP routes locally) | +0.55 |
+| attention core | +0.20 |
+| collective latency after the last rank arrives | +0.19 |
+| qkvg | -0.18 |
 
-- The 5.2 ms/step gap (device-averaged regions, SP + EP minus TP):
-
-  | cause | ms/step |
-  |---|---|
-  | expert imbalance: waiting at combine a2a / row AG for the busiest rank (10.6 experts vs mean 6.7; TP holds 1/8 of every expert, so it stays even) | +1.95 |
-  | replicated pool + unpool (32 + 32 MiB per layer vs TP's 1/8) | +1.25 |
-  | o-proj row RS (56 x 4 KiB DMAs per layer, matmul gated on send completions) | +0.62 |
-  | expert per-chunk overhead outside the q8 arm (device mean 4.33 vs 3.78) | +0.55 |
-  | routing exchange (counts, items, dispatch, fill; TP routes locally) | +0.53 |
-  | attention on 16 padded rows, all 8 live rows on ranks 0-3 | +0.21 |
-  | row AG / combine latency after the last rank arrives, vs TP's u AG / y RS | +0.16 |
-  | qkvg | -0.10 |
-- ICI bandwidth is not the limit: once the last rank arrives, row AG takes 4.8 us, counts 3.9, items 2.9 and the o RS 13.7 per layer for 8 rows; these are latency-bound rounds of small DMAs.
-- The b1 program is r16 (8 rows padded): 305k bundles and 26.5k spills against TP r8's 175k and 11.3k. Padded rows are masked out of routing (n_live), but SP puts all 8 live rows on ranks 0-3 (2 each).
-- Per 3 MiB expert chunk the q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks). EP is ~0.24 us/chunk slower outside it (~0.6-0.8 ms/step): all four weight DMAs are awaited before the arm (TP awaits w2 inside), and every item zeroes / reads its accumulator at 32 rows.
+- ICI bandwidth is not the limit: once the last rank arrives, each collective is a few us per layer of latency-bound small DMAs.
+- Per 3 MiB expert chunk the q8 arm is the same in both LLOs (768 fp8 pushes, 96 matmuls, 1536 s4 unpacks; b1 LLO `20261116-020301-54f1`). EP is slower outside it: all four weight DMAs are awaited before the arm (TP awaits w2 inside), and every item zeroes / reads its accumulator at 32 rows.
+- Tried: one o RS DMA per owner after the last column tile (+0.2 ms, loses the overlap with the matmul); o through TP's column RS + AG (-0.14 ms at b1, +0.74 ms at b8: unfolded post-attention pass).
 
 ### Prefill SP + EP over the cached context
 
